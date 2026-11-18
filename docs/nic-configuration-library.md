@@ -160,12 +160,61 @@ func NewConfigurationManager(
 #### NV Configuration Flow
 
 1. **Spectrum-X plan precondition** — before per-device validation, the controller generates or reuses one node-scoped `prepare` plan. Spectrum-X devices require a matching cached plan; validation and apply fail closed when it is missing
-2. **Native query and validation** — query current NV config via `nvConfigUtils.QueryNvConfig()` and independently validate the template-derived native parameter map. `rawNvConfig` is temporarily rejected when Spectrum-X is enabled
-3. **Network Bay profile resolution** — for non-Spectrum-X Network Bay devices, run `show_system_conf`, select the named profile and detected ASIC, and expand range assignments such as `MODULE_SPLIT_M0[4..15]=FF` into concrete keys. The profile is the lowest-priority native layer; template and `rawNvConfig` values override it. `networkBay` remains temporarily rejected with Spectrum-X until DMS can represent and validate profile parameters below typed doSPCX operations
+2. **Native query and validation** — query current NV config via `nvConfigUtils.QueryNvConfig()` and validate the template-derived native parameter map with `rawNvConfig` merged last. These native values take precedence over doSPCX typed intent
+3. **Network Bay profile resolution** — run `show_system_conf`, select the named profile and detected ASIC, and expand range assignments such as `MODULE_SPLIT_M0[4..15]=FF` into concrete keys. Before merging template and `rawNvConfig` overrides, remove profile defaults owned by the prepared doSPCX breakout and post-breakout operations. Direct ownership comes from DMS current/pending `_nvconfig` metadata and must agree across PCI functions; lane ownership comes from each typed operation's module and listed lane indices. The resulting precedence is system profile < doSPCX < template < `rawNvConfig`
 4. **Native diff** — compare the complete native map against every target, normalizing symbolic, decimal, `0x` hexadecimal, and bare hexadecimal values; skip hidden/unsupported params and preserve the existing `with-default` and `force` behavior
-5. **doSPCX query and barrier** — query each plan leaf and its `-pending` leaf separately through DMS on every discovered PCI function, using `pci/<BDF>?port=1` because split functions expose their NVConfig as port 1. Validate breakout first; post-breakout becomes active only after breakout matches both current and pending state on every function
-6. **Combined NVConfig batch** — send template-derived native parameters and doSPCX typed operations in one `/nvidia/nvconfig/apply` action through the primary PF, with `ports: [1..N]` for every available logical port. Normal apply sends the active phase; `Force` sends breakout plus post-breakout immediately, and post-breakout `WithDefault` resends both phases
+5. **doSPCX query and barrier** — query each plan leaf and its `-pending` leaf separately through DMS on every discovered PCI function, using `pci/<BDF>?port=1` because split functions expose their NVConfig as port 1. Use the returned `_nvconfig` metadata to associate each concrete XPath with its native parameter. For an overridden leaf, compare native current/next-boot values with the effective native value; validate all other leaves against typed intent. Validate breakout first; post-breakout becomes active only after its effective configuration matches both current and pending state on every function
+6. **Combined NVConfig batch** — send template-derived native parameters and doSPCX typed operations in one `/nvidia/nvconfig/apply` action per discovered PCI function, with `ports: [1]` for its local port. Normal apply sends the active phase; `Force` sends breakout plus post-breakout immediately, and post-breakout `WithDefault` resends both phases
 7. **Optional reset** — `mlxfwreset` unless `ConfigurationOptions.SkipReset=true`
+
+Native override validation requires a DMS build containing DOCA changes 1508833
+and 1521729. `QueryXPathsResult.NVConfig` contains the concrete leaf XPath to
+native parameter mapping, separate from `Values`; current and `-pending` paths
+retain their own keys. Both mappings must be present and refer to the same native
+parameter, including link type and indexed breakout planes. Missing or
+inconsistent direct mappings produce an error before apply, even when `Force`
+is enabled.
+Composite breakout `lanes` have no direct mapping. Supported native
+`MODULE_SPLIT_M<module>[lane]` assignments are validated against native current
+and next-boot values; their indices are excluded from the desired, current, and
+pending typed lane lists before comparing the remaining membership. Unsupported
+native assignments do not suppress typed validation. Breakout lane GETs are
+replaced by native array reads to avoid DMS sibling-query failures. Lane writes
+are compiled to native assignments within the same combined DMS apply action.
+Other modules are unaffected.
+This supports Network Bay defaults and explicit lane overrides without DMS changes.
+RoCE NVConfig leaves under `/nvidia/roce` use native current/next-boot validation
+and local ownership mappings to avoid legacy DMS GET reading unsupported, unrequested
+siblings such as `MULTIPATH_DSCP`. Only requested parameters are checked; a missing
+requested value remains an error. Fresh complete native snapshots are reused; other
+callers query the requested parameters. Explicit native overrides retain precedence.
+RoCE writes remain typed operations in the same combined DMS apply action.
+With `Force`, profile and explicit-override port parameters are expanded before
+profile filtering, so expansion cannot restore a default shadowed by doSPCX.
+Inferred sibling-port overrides do not replace explicit profile values; an
+explicit override for that sibling still takes precedence.
+
+The public base `NVConfigUtils` interface is unchanged. Implementations used
+with combined native and typed intent must also provide the optional method:
+
+```go
+ValidateNvConfigXPathsWithOverrides(
+    ctx context.Context,
+    ports []v1alpha1.NicDevicePortSpec,
+    operations []dmscli.XPathOperation,
+    nativeParams map[string]string,
+    configs map[string]types.NvConfigQuery,
+) (updateNeeded, rebootNeeded bool, err error)
+```
+
+`configs` contains fresh native state keyed by PCI address. `QueryNvConfig`
+marks unfiltered results with `AllParameters=true`; those snapshots can be reused
+for complete lane membership checks. Filtered and manually assembled snapshots
+leave this flag false, so the utility refreshes the required module arrays and
+preserves unrelated native override state without mutating caller maps. The
+standard utility implements this method. Secondary-function verification refreshes
+native state after apply before checking overrides. Hidden native parameters remain reported
+as unsupported and do not suppress typed validation when omitted from apply.
 
 **`ConfigurationOptions`:**
 - `SkipReset` — skip `mlxfwreset` after applying NV config
@@ -383,16 +432,15 @@ dms-cli --json -t pci/<BDF> --input <payload-json> /nvidia/nvconfig/apply
 
 The payload supports `ports`, `typed`, `raw`, `with-default`, and `force`.
 `Target` is carried by `-t` and is not serialized. For Spectrum-X, the target
-is the primary PF, `ports` contains every available logical port (`[1..N]`),
+is each discovered PCI function in turn, `ports` contains its local port (`[1]`),
 and the existing template-derived native parameters and doSPCX prepare operations are
 sent in one action. `with-default` and `force` apply to that combined action;
 both send the complete breakout plus post-breakout intent once the breakout
 barrier is complete, and `force` does so immediately.
 
-The current DMS apply action accepts one primary BDF. Its `ports` field expands
-port-scoped native parameter names but does not target additional split-function
-BDFs. Multi-target apply for those functions therefore depends on a future DMS
-API extension.
+Each DMS apply action accepts one BDF. The configuration manager invokes it
+separately for every discovered function, preserving native overrides within each
+batch. Pending state on every function is verified after all writes before permitting reboot.
 
 Typed GET and SET preserve query/group order and use `;` as a literal argument
 between DMS containers:
@@ -528,17 +576,26 @@ startup; later `PreparePlan` calls reuse memory while the inputs match.
 the request unless both cached stages and target-map membership match the
 supplied device.
 
-Compilation produces homogeneous configuration intent rather than resolving
-operations onto individual devices. Prepare-stage `breakout` and `post-breakout`
+Compilation retains operation target filters in an immutable internal cache.
+`GetPreparedPlan` selects operations for the requesting NIC using its validated
+pre-breakout target-map entry and returns independent operation values. It
+supports `target_filter.hca_type` and `target_filter.nic_index_in_rail`; both
+constraints must match. An absent NIC-index filter is unrestricted, while an
+explicit empty list selects no NIC. A constrained VR operation requires an
+explicit NIC index in the target map; non-VR single-NIC rails default to index
+zero. Unsupported selectors, including `planes`, and malformed filters fail
+explicitly rather than broadening the operation's scope.
+
+Prepare-stage `breakout` and `post-breakout`
 groups become ordered XPath operation slices. Configure-stage `link-runtime`,
 `cc`, and `link-event` groups become ordered `OperationGroup` values. Each group
 preserves its scope and the order of `semantic.groups[].operation_refs`, including
 repeated writes. Each runtime XPath operation preserves its effective `scope` and
 `target_class`. Operations with `scope=per_vf` or `target_class=per_eswitch` are
-excluded from the host-Kubernetes runtime plan. Device targeting and construction
-of validation queries belong to the configuration manager when it consumes this
-plan. Runtime apply preserves the authored batch order. Validation ignores values
-shadowed by later batches on the same target, while keeping different scope and
+excluded from the host-Kubernetes runtime plan. Per-port runtime targeting and
+construction of validation queries belong to the configuration manager when it
+consumes this per-NIC plan. Runtime apply preserves the authored batch order. Validation ignores values
+shadowed by later batches across all runtime groups on the same target, while keeping different scope and
 target-class pairs in separate DMS commands.
 
 Public operations may omit `kind` (`set` is the DMS default). Bare-metal steps,
@@ -552,6 +609,7 @@ type SpectrumXManager interface {
     PlanManager
     BlueprintsDataManager
     RunDocaSpcXCC(port v1alpha1.NicDevicePortSpec) error
+    IsDocaSpcXCCRunning(rdma string) bool
     GetCCTerminationChannel() <-chan string
 }
 ```
@@ -648,7 +706,7 @@ implementations. Implementations without the extension continue through the lega
 
 The built-in implementation also supports doSPCX XPath validation and combined
 native/typed apply. It validates each discovered PCI function through
-`pci/<BDF>?port=1` and uses `ports: [1..N]` in the combined apply payload.
+`pci/<BDF>?port=1` and uses `ports: [1]` in each function's combined apply payload.
 Spectrum-X configuration fails closed when a custom utility does not provide
 these optional methods.
 
@@ -726,6 +784,7 @@ type NvConfigQuery struct {
     DefaultConfig  map[string][]string // Default NV config values
     CurrentConfig  map[string][]string // Currently applied values
     NextBootConfig map[string][]string // Values effective after next boot
+    AllParameters  bool                // True only for an unfiltered native query
 }
 
 type VPD struct {
@@ -808,7 +867,6 @@ Source: `pkg/consts/consts.go`
 | `SriovEnabledParam` | `SRIOV_EN` |
 | `SriovNumOfVfsParam` | `NUM_OF_VFS` |
 | `LinkTypeP1Param` / `LinkTypeP2Param` | `LINK_TYPE_P1` / `LINK_TYPE_P2` |
-| `MaxAccOutReadParam` | `MAX_ACC_OUT_READ` (constant only; `template.pciPerformanceOptimized.maxAccOutRead` is deprecated and ignored) |
 | `RoceCcPrioMaskP1Param` / `RoceCcPrioMaskP2Param` | `ROCE_CC_PRIO_MASK_P1` / `_P2` |
 | `CnpDscpP1Param` / `CnpDscpP2Param` | `CNP_DSCP_P1` / `_P2` |
 | `AtsEnabledParam` | `ATS_ENABLED` |
@@ -964,7 +1022,7 @@ logs and returned errors. Output is not duplicated in error-level logs.
 
 ### Batch Operations
 
-- **NVConfig apply**: the non-Spectrum-X path keeps one sorted raw batch per PCI target. The Spectrum-X path sends one combined template-native/typed batch through the primary PF with every available logical port in `ports`; DMS executes one primary-PF `mlxconfig` operation
+- **NVConfig apply**: the non-Spectrum-X path keeps one sorted raw batch per PCI target. The Spectrum-X path sends one combined template-native/typed batch per PCI function with local port 1 in `ports`; DMS executes one `mlxconfig` operation per function
 - **DMS**: `GetParameters()` batches `--path` entries per concrete interface (with a separate global batch), and `SetParameters()` sends all `--update` entries in a single `dmsc set` command with `--timeout 5m`
 - **IgnoreError**: per-parameter flag; in batch mode, errors are suppressed only if ALL params have `IgnoreError=true`
 
@@ -982,3 +1040,10 @@ K8s-free packages (`pkg/spectrumx/`, `pkg/dms/`) communicate with controllers vi
 | `a819489` — Refactor DMS to single daemon | Single `dmsd` process for all devices, `dmsClient` with `--target`, `IsRunning()` on manager | `DMSManager.StartDMSServer` replaces `StartDMSInstances`; `DMSClient.IsRunning()` removed |
 | `852ced3` — Fix CX8 reboot blocked by mlxfwreset | Treat `mlxfwreset` failure as non-fatal in controller | No library API change; behavioral fix for CX8 SuperNIC devices |
 | `3bf35c5` — Batch SetParameters | `collectSetUpdates` + single `dmsc set` with multiple `--update` flags + `--timeout 5m` | `SetParameters` now executes one command instead of N; `formatSetUpdate` shared helper |
+
+Runtime sections are validated concurrently. A mismatch or read error cancels the
+other sections and joins their workers before configuration writes begin. A required
+CC process that is absent or still starting makes validation return false immediately;
+process startup remains in the apply phase. Custom implementations of
+`SpectrumXManager` must implement `IsDocaSpcXCCRunning` without starting a process.
+DMS CLI command-output logs include elapsed command execution time as `duration_ms`.

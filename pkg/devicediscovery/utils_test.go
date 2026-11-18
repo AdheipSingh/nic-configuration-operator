@@ -20,7 +20,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -34,283 +33,15 @@ const (
 	serialNumber = "MT2235J01129"
 )
 
+func writeRDMASysfsFixture(root, rdmaDevice, firmwareVersion, psid string) {
+	GinkgoHelper()
+	rdmaDevicePath := filepath.Join(root, pciAddress, "infiniband", rdmaDevice)
+	Expect(os.MkdirAll(rdmaDevicePath, 0o755)).To(Succeed())
+	Expect(os.WriteFile(filepath.Join(rdmaDevicePath, "fw_ver"), []byte(firmwareVersion), 0o644)).To(Succeed())
+	Expect(os.WriteFile(filepath.Join(rdmaDevicePath, "board_id"), []byte(psid), 0o644)).To(Succeed())
+}
+
 var _ = Describe("HostUtils", func() {
-	//nolint:dupl
-	Describe("GetVPD", func() {
-		var originalBackoff time.Duration
-
-		BeforeEach(func() {
-			originalBackoff = mlxvpdBackoff
-			mlxvpdBackoff = 1 * time.Millisecond
-		})
-
-		AfterEach(func() {
-			mlxvpdBackoff = originalBackoff
-		})
-
-		It("should return part, serial and model name", func() {
-			modelName := "ConnectX-6 Dx EN adapter card, 100GbE, Dual-port QSFP56, PCIe 4.0 x16, Crypto, No Secure Boot"
-
-			fakeExec := &execTesting.FakeExec{}
-
-			fakeCmd := &execTesting.FakeCmd{}
-			fakeCmd.CombinedOutputScript = append(fakeCmd.CombinedOutputScript, func() ([]byte, []byte, error) {
-				return []byte("  VPD-KEYWORD    DESCRIPTION             VALUE\n" +
-						"  -----------    -----------             -----\n" +
-						"Read Only Section:\n" +
-						"\n" +
-						"  PN             Part Number             " + partNumber + "\n" +
-						"  EC             Revision                AB\n" +
-						"  SN             Serial Number           " + serialNumber + "\n" +
-						"  V3             N/A                     3869145f5722ed118000b83fd2193152\n" +
-						"  IDTAG          Board Id                " + modelName + "\n"),
-					nil, nil
-			})
-
-			fakeExec.CommandScript = append(fakeExec.CommandScript, func(cmd string, args ...string) exec.Cmd {
-				Expect(cmd).To(Equal("mlxvpd"))
-				Expect(args[0]).To(Equal("-d"))
-				Expect(args[1]).To(Equal(pciAddress))
-				return fakeCmd
-			})
-
-			h := &deviceDiscoveryUtils{
-				execInterface: fakeExec,
-			}
-
-			vpd, err := h.GetVPD(pciAddress)
-
-			Expect(err).NotTo(HaveOccurred())
-			Expect(vpd.PartNumber).To(Equal(partNumber))
-			Expect(vpd.SerialNumber).To(Equal(serialNumber))
-			Expect(vpd.ModelName).To(Equal(modelName))
-		})
-		It("should return error when PN or SN is missing from both tools", func() {
-			fakeExec := &execTesting.FakeExec{}
-
-			mlxvpdCmd := &execTesting.FakeCmd{}
-			mlxvpdCmd.CombinedOutputScript = append(mlxvpdCmd.CombinedOutputScript, func() ([]byte, []byte, error) {
-				return []byte("  SN             Serial Number           " + serialNumber + "\n"), nil, nil
-			})
-			mstvpdCmd := &execTesting.FakeCmd{}
-			mstvpdCmd.CombinedOutputScript = append(mstvpdCmd.CombinedOutputScript, func() ([]byte, []byte, error) {
-				return []byte("SN:      " + serialNumber + "\n"), nil, nil
-			})
-
-			fakeExec.CommandScript = append(fakeExec.CommandScript,
-				func(cmd string, args ...string) exec.Cmd {
-					Expect(cmd).To(Equal("mlxvpd"))
-					Expect(args[0]).To(Equal("-d"))
-					Expect(args[1]).To(Equal(pciAddress))
-					return mlxvpdCmd
-				},
-				func(cmd string, args ...string) exec.Cmd {
-					Expect(cmd).To(Equal("mstvpd"))
-					Expect(args[0]).To(Equal(pciAddress))
-					return mstvpdCmd
-				},
-			)
-
-			h := &deviceDiscoveryUtils{
-				execInterface: fakeExec,
-			}
-
-			vpd, err := h.GetVPD(pciAddress)
-
-			Expect(err).To(HaveOccurred())
-			Expect(vpd).To(BeNil())
-		})
-		It("should set empty model name when IDTAG is absent", func() {
-			fakeExec := &execTesting.FakeExec{}
-
-			fakeCmd := &execTesting.FakeCmd{}
-			fakeCmd.CombinedOutputScript = append(fakeCmd.CombinedOutputScript, func() ([]byte, []byte, error) {
-				return []byte("  VPD-KEYWORD    DESCRIPTION             VALUE\n" +
-						"  -----------    -----------             -----\n" +
-						"Read Only Section:\n" +
-						"\n" +
-						"  PN             Part Number             " + partNumber + "\n" +
-						"  SN             Serial Number           " + serialNumber + "\n" +
-						"  V3             N/A                     3869145f5722ed118000b83fd2193152\n"),
-					nil, nil
-			})
-
-			fakeExec.CommandScript = append(fakeExec.CommandScript, func(cmd string, args ...string) exec.Cmd {
-				Expect(cmd).To(Equal("mlxvpd"))
-				Expect(args[0]).To(Equal("-d"))
-				Expect(args[1]).To(Equal(pciAddress))
-				return fakeCmd
-			})
-
-			h := &deviceDiscoveryUtils{
-				execInterface: fakeExec,
-			}
-
-			vpd, err := h.GetVPD(pciAddress)
-
-			Expect(err).NotTo(HaveOccurred())
-			Expect(vpd.PartNumber).To(Equal(partNumber))
-			Expect(vpd.SerialNumber).To(Equal(serialNumber))
-			Expect(vpd.ModelName).To(Equal(""))
-		})
-		It("should retry and succeed on the 2nd attempt", func() {
-			fakeExec := &execTesting.FakeExec{}
-
-			failingCmd := &execTesting.FakeCmd{}
-			failingCmd.CombinedOutputScript = append(failingCmd.CombinedOutputScript, func() ([]byte, []byte, error) {
-				return nil, nil, errors.New("exit status 2")
-			})
-
-			successCmd := &execTesting.FakeCmd{}
-			successCmd.CombinedOutputScript = append(successCmd.CombinedOutputScript, func() ([]byte, []byte, error) {
-				return []byte("  PN             Part Number             " + partNumber + "\n" +
-						"  SN             Serial Number           " + serialNumber + "\n"),
-					nil, nil
-			})
-
-			cmds := []exec.Cmd{failingCmd, successCmd}
-			fakeExec.CommandScript = append(fakeExec.CommandScript,
-				func(cmd string, args ...string) exec.Cmd {
-					Expect(cmd).To(Equal("mlxvpd"))
-					return cmds[0]
-				},
-				func(cmd string, args ...string) exec.Cmd {
-					Expect(cmd).To(Equal("mlxvpd"))
-					return cmds[1]
-				},
-			)
-
-			h := &deviceDiscoveryUtils{
-				execInterface: fakeExec,
-			}
-
-			vpd, err := h.GetVPD(pciAddress)
-
-			Expect(err).NotTo(HaveOccurred())
-			Expect(vpd.PartNumber).To(Equal(partNumber))
-			Expect(vpd.SerialNumber).To(Equal(serialNumber))
-			Expect(fakeExec.CommandCalls).To(Equal(2))
-		})
-		It("should retry mlxvpd up to maxAttempts, then fall back to mstvpd, and error if both fail", func() {
-			fakeExec := &execTesting.FakeExec{}
-
-			newFailingMlxvpd := func() exec.Cmd {
-				c := &execTesting.FakeCmd{}
-				c.CombinedOutputScript = append(c.CombinedOutputScript, func() ([]byte, []byte, error) {
-					return []byte("mlxvpd: failed to read VPD"), nil, errors.New("exit status 2")
-				})
-				return c
-			}
-			failingMstvpd := &execTesting.FakeCmd{}
-			failingMstvpd.CombinedOutputScript = append(failingMstvpd.CombinedOutputScript, func() ([]byte, []byte, error) {
-				return []byte("mstvpd: error"), nil, errors.New("exit status 2")
-			})
-
-			for i := 0; i < mlxvpdMaxAttempts; i++ {
-				fakeExec.CommandScript = append(fakeExec.CommandScript, func(cmd string, args ...string) exec.Cmd {
-					Expect(cmd).To(Equal("mlxvpd"))
-					return newFailingMlxvpd()
-				})
-			}
-			fakeExec.CommandScript = append(fakeExec.CommandScript, func(cmd string, args ...string) exec.Cmd {
-				Expect(cmd).To(Equal("mstvpd"))
-				Expect(args[0]).To(Equal(pciAddress))
-				return failingMstvpd
-			})
-
-			h := &deviceDiscoveryUtils{
-				execInterface: fakeExec,
-			}
-
-			vpd, err := h.GetVPD(pciAddress)
-
-			Expect(err).To(HaveOccurred())
-			Expect(vpd).To(BeNil())
-			Expect(fakeExec.CommandCalls).To(Equal(mlxvpdMaxAttempts + 1))
-		})
-		It("should fall back to mstvpd when mlxvpd exhausts retries", func() {
-			modelName := "NVIDIA BlueField-4 B4240V 800G Liquid Cooled DPU"
-			fakeExec := &execTesting.FakeExec{}
-
-			newFailingMlxvpd := func() exec.Cmd {
-				c := &execTesting.FakeCmd{}
-				c.CombinedOutputScript = append(c.CombinedOutputScript, func() ([]byte, []byte, error) {
-					return []byte("Segmentation fault (core dumped)"), nil, errors.New("exit status 139")
-				})
-				return c
-			}
-			successMstvpd := &execTesting.FakeCmd{}
-			successMstvpd.CombinedOutputScript = append(successMstvpd.CombinedOutputScript, func() ([]byte, []byte, error) {
-				return []byte("ID:      " + modelName + "\n" +
-					"PN:      " + partNumber + "\n" +
-					"EC:      B2\n" +
-					"SN:      " + serialNumber + "\n" +
-					"V3:      f264019afb2df1118000dc73fc0521ea\n"), nil, nil
-			})
-
-			for i := 0; i < mlxvpdMaxAttempts; i++ {
-				fakeExec.CommandScript = append(fakeExec.CommandScript, func(cmd string, args ...string) exec.Cmd {
-					Expect(cmd).To(Equal("mlxvpd"))
-					return newFailingMlxvpd()
-				})
-			}
-			fakeExec.CommandScript = append(fakeExec.CommandScript, func(cmd string, args ...string) exec.Cmd {
-				Expect(cmd).To(Equal("mstvpd"))
-				Expect(args[0]).To(Equal(pciAddress))
-				return successMstvpd
-			})
-
-			h := &deviceDiscoveryUtils{
-				execInterface: fakeExec,
-			}
-
-			vpd, err := h.GetVPD(pciAddress)
-
-			Expect(err).NotTo(HaveOccurred())
-			Expect(vpd.PartNumber).To(Equal(partNumber))
-			Expect(vpd.SerialNumber).To(Equal(serialNumber))
-			Expect(vpd.ModelName).To(Equal(modelName))
-			Expect(fakeExec.CommandCalls).To(Equal(mlxvpdMaxAttempts + 1))
-		})
-		It("should fall back to mstvpd when mlxvpd output is unparseable", func() {
-			fakeExec := &execTesting.FakeExec{}
-
-			// mlxvpd returns a 0 exit code but with unparseable / missing fields.
-			badMlxvpd := &execTesting.FakeCmd{}
-			badMlxvpd.CombinedOutputScript = append(badMlxvpd.CombinedOutputScript, func() ([]byte, []byte, error) {
-				return []byte("some garbage output with no PN or SN\n"), nil, nil
-			})
-			successMstvpd := &execTesting.FakeCmd{}
-			successMstvpd.CombinedOutputScript = append(successMstvpd.CombinedOutputScript, func() ([]byte, []byte, error) {
-				return []byte("PN:      " + partNumber + "\n" +
-					"SN:      " + serialNumber + "\n"), nil, nil
-			})
-
-			fakeExec.CommandScript = append(fakeExec.CommandScript,
-				func(cmd string, args ...string) exec.Cmd {
-					Expect(cmd).To(Equal("mlxvpd"))
-					return badMlxvpd
-				},
-				func(cmd string, args ...string) exec.Cmd {
-					Expect(cmd).To(Equal("mstvpd"))
-					Expect(args[0]).To(Equal(pciAddress))
-					return successMstvpd
-				},
-			)
-
-			h := &deviceDiscoveryUtils{
-				execInterface: fakeExec,
-			}
-
-			vpd, err := h.GetVPD(pciAddress)
-
-			Expect(err).NotTo(HaveOccurred())
-			Expect(vpd.PartNumber).To(Equal(partNumber))
-			Expect(vpd.SerialNumber).To(Equal(serialNumber))
-			Expect(vpd.ModelName).To(Equal(""))
-		})
-	})
-
 	Describe("getFwctlDeviceFromPath", func() {
 		It("returns the dev path for a discovered fwctl entry", func() {
 			root := GinkgoT().TempDir()
@@ -363,7 +94,6 @@ var _ = Describe("HostUtils", func() {
 		It("should return lowercased firmware version and PSID from flint", func() {
 			fwVersion := "VeRsIoN"
 			psid := "PSID"
-			devlinkCalled := false
 
 			fakeExec := &execTesting.FakeExec{}
 
@@ -384,10 +114,7 @@ var _ = Describe("HostUtils", func() {
 
 			h := &deviceDiscoveryUtils{
 				execInterface: fakeExec,
-				getDevlinkInfo: func(_, _ string) (map[string]string, error) {
-					devlinkCalled = true
-					return nil, errors.New("devlink should not be called")
-				},
+				pciSysfsRoot:  filepath.Join(GinkgoT().TempDir(), "missing"),
 			}
 
 			firmwareVersion, actualPSID, err := h.GetFirmwareVersionAndPSID(pciAddress)
@@ -395,15 +122,14 @@ var _ = Describe("HostUtils", func() {
 			Expect(err).NotTo(HaveOccurred())
 			Expect(firmwareVersion).To(Equal(strings.ToLower(fwVersion)))
 			Expect(actualPSID).To(Equal(strings.ToLower(psid)))
-			Expect(devlinkCalled).To(BeFalse())
 		})
 
-		It("should fall back to devlink when flint fails", func() {
+		It("should fall back to RDMA sysfs when flint fails on the affected ConnectX-7 function", func() {
 			fakeExec := &execTesting.FakeExec{}
 
 			fakeCmd := &execTesting.FakeCmd{}
 			fakeCmd.OutputScript = append(fakeCmd.OutputScript, func() ([]byte, []byte, error) {
-				return nil, []byte("ICMD failed"), errors.New("exit status 1")
+				return nil, []byte("-E- Cannot open Device: 0000:a3:00.0. ICMD bad parameter given"), errors.New("exit status 1")
 			})
 
 			fakeExec.CommandScript = append(fakeExec.CommandScript, func(cmd string, args ...string) exec.Cmd {
@@ -412,26 +138,18 @@ var _ = Describe("HostUtils", func() {
 				return fakeCmd
 			})
 
-			h := &deviceDiscoveryUtils{
-				execInterface: fakeExec,
-				getDevlinkInfo: func(bus, device string) (map[string]string, error) {
-					Expect(bus).To(Equal("pci"))
-					Expect(device).To(Equal(pciAddress))
-					return map[string]string{
-						"fw.version": "32.43.2026",
-						"fw.psid":    "MT_0000000742",
-					}, nil
-				},
-			}
+			root := GinkgoT().TempDir()
+			writeRDMASysfsFixture(root, "mlx5_7", "28.48.1132\n", "NVD0000000079\n")
+			h := &deviceDiscoveryUtils{execInterface: fakeExec, pciSysfsRoot: root}
 
 			firmwareVersion, actualPSID, err := h.GetFirmwareVersionAndPSID(pciAddress)
 
 			Expect(err).NotTo(HaveOccurred())
-			Expect(firmwareVersion).To(Equal("32.43.2026"))
-			Expect(actualPSID).To(Equal("mt_0000000742"))
+			Expect(firmwareVersion).To(Equal("28.48.1132"))
+			Expect(actualPSID).To(Equal("nvd0000000079"))
 		})
 
-		It("should fall back to the generic devlink FW key when flint output is incomplete", func() {
+		It("should fall back to RDMA sysfs when flint output is incomplete", func() {
 			fakeExec := &execTesting.FakeExec{}
 
 			fakeCmd := &execTesting.FakeCmd{}
@@ -445,24 +163,59 @@ var _ = Describe("HostUtils", func() {
 				return fakeCmd
 			})
 
-			h := &deviceDiscoveryUtils{
-				execInterface: fakeExec,
-				getDevlinkInfo: func(_, _ string) (map[string]string, error) {
-					return map[string]string{
-						"fw":      "32.43.2026",
-						"fw.psid": "MT_0000000742",
-					}, nil
-				},
-			}
+			root := GinkgoT().TempDir()
+			writeRDMASysfsFixture(root, "mlx5_0", "40.48.1132\n", "NVD0000000072\n")
+			h := &deviceDiscoveryUtils{execInterface: fakeExec, pciSysfsRoot: root}
 
 			firmwareVersion, actualPSID, err := h.GetFirmwareVersionAndPSID(pciAddress)
 
 			Expect(err).NotTo(HaveOccurred())
-			Expect(firmwareVersion).To(Equal("32.43.2026"))
-			Expect(actualPSID).To(Equal("mt_0000000742"))
+			Expect(firmwareVersion).To(Equal("40.48.1132"))
+			Expect(actualPSID).To(Equal("nvd0000000072"))
 		})
 
-		It("should return an error when both flint and devlink fail", func() {
+		It("should use a complete RDMA device without combining partial data from another entry", func() {
+			root := GinkgoT().TempDir()
+			writeRDMASysfsFixture(root, "mlx5_7", "28.48.1132\n", " \n")
+			writeRDMASysfsFixture(root, "mlx5_8", "28.48.1132\n", "NVD0000000079\n")
+
+			firmwareVersion, actualPSID, err := getFirmwareVersionAndPSIDFromSysfs(root, pciAddress)
+
+			Expect(err).NotTo(HaveOccurred())
+			Expect(firmwareVersion).To(Equal("28.48.1132"))
+			Expect(actualPSID).To(Equal("nvd0000000079"))
+		})
+
+		It("should follow the PCI function's RDMA sysfs symlink", func() {
+			root := GinkgoT().TempDir()
+			target := filepath.Join(root, "class", "infiniband", "mlx5_7")
+			Expect(os.MkdirAll(target, 0o755)).To(Succeed())
+			Expect(os.WriteFile(filepath.Join(target, "fw_ver"), []byte("28.48.1132\n"), 0o644)).To(Succeed())
+			Expect(os.WriteFile(filepath.Join(target, "board_id"), []byte("NVD0000000079\n"), 0o644)).To(Succeed())
+			rdmaDir := filepath.Join(root, pciAddress, "infiniband")
+			Expect(os.MkdirAll(rdmaDir, 0o755)).To(Succeed())
+			Expect(os.Symlink(target, filepath.Join(rdmaDir, "mlx5_7"))).To(Succeed())
+
+			firmwareVersion, actualPSID, err := getFirmwareVersionAndPSIDFromSysfs(root, pciAddress)
+
+			Expect(err).NotTo(HaveOccurred())
+			Expect(firmwareVersion).To(Equal("28.48.1132"))
+			Expect(actualPSID).To(Equal("nvd0000000079"))
+		})
+
+		It("should reject complementary partial data from different RDMA devices", func() {
+			root := GinkgoT().TempDir()
+			writeRDMASysfsFixture(root, "mlx5_7", "28.48.1132\n", " \n")
+			writeRDMASysfsFixture(root, "mlx5_8", " \n", "NVD0000000079\n")
+
+			firmwareVersion, actualPSID, err := getFirmwareVersionAndPSIDFromSysfs(root, pciAddress)
+
+			Expect(err).To(MatchError(ContainSubstring("no RDMA device")))
+			Expect(firmwareVersion).To(BeEmpty())
+			Expect(actualPSID).To(BeEmpty())
+		})
+
+		It("should return an error when both flint and RDMA sysfs fail", func() {
 			fakeExec := &execTesting.FakeExec{}
 			fakeCmd := &execTesting.FakeCmd{}
 			fakeCmd.OutputScript = append(fakeCmd.OutputScript, func() ([]byte, []byte, error) {
@@ -472,43 +225,29 @@ var _ = Describe("HostUtils", func() {
 				return fakeCmd
 			})
 
-			h := &deviceDiscoveryUtils{
-				execInterface: fakeExec,
-				getDevlinkInfo: func(_, _ string) (map[string]string, error) {
-					return nil, errors.New("devlink failure")
-				},
-			}
+			root := GinkgoT().TempDir()
+			Expect(os.MkdirAll(filepath.Join(root, pciAddress, "infiniband"), 0o755)).To(Succeed())
+			h := &deviceDiscoveryUtils{execInterface: fakeExec, pciSysfsRoot: root}
 
 			firmwareVersion, actualPSID, err := h.GetFirmwareVersionAndPSID(pciAddress)
 
 			Expect(err).To(MatchError(And(
 				ContainSubstring("flint failure"),
-				ContainSubstring("devlink failure"),
+				ContainSubstring("no RDMA devices found"),
 			)))
 			Expect(firmwareVersion).To(BeEmpty())
 			Expect(actualPSID).To(BeEmpty())
 		})
 
-		It("should return an error when devlink omits the PSID", func() {
-			fakeExec := &execTesting.FakeExec{}
-			fakeCmd := &execTesting.FakeCmd{}
-			fakeCmd.OutputScript = append(fakeCmd.OutputScript, func() ([]byte, []byte, error) {
-				return nil, nil, errors.New("flint failure")
-			})
-			fakeExec.CommandScript = append(fakeExec.CommandScript, func(_ string, _ ...string) exec.Cmd {
-				return fakeCmd
-			})
+		It("should return a contextual error when a sysfs attribute cannot be read", func() {
+			root := GinkgoT().TempDir()
+			rdmaDevice := filepath.Join(root, pciAddress, "infiniband", "mlx5_7")
+			Expect(os.MkdirAll(filepath.Join(rdmaDevice, "fw_ver"), 0o755)).To(Succeed())
+			Expect(os.WriteFile(filepath.Join(rdmaDevice, "board_id"), []byte("NVD0000000079\n"), 0o644)).To(Succeed())
 
-			h := &deviceDiscoveryUtils{
-				execInterface: fakeExec,
-				getDevlinkInfo: func(_, _ string) (map[string]string, error) {
-					return map[string]string{"fw.version": "32.43.2026"}, nil
-				},
-			}
+			firmwareVersion, actualPSID, err := getFirmwareVersionAndPSIDFromSysfs(root, pciAddress)
 
-			firmwareVersion, actualPSID, err := h.GetFirmwareVersionAndPSID(pciAddress)
-
-			Expect(err).To(MatchError(ContainSubstring("devlink info has empty firmware version")))
+			Expect(err).To(MatchError(ContainSubstring("reading firmware version for RDMA device mlx5_7")))
 			Expect(firmwareVersion).To(BeEmpty())
 			Expect(actualPSID).To(BeEmpty())
 		})

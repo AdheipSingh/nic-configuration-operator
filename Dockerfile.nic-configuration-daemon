@@ -1,7 +1,8 @@
 ARG BASE_IMAGE_DOCA_FULL_RT_HOST
 
 # Build the manager binary
-FROM golang:1.27 AS builder
+ARG BASE_IMAGE_GO_BUILDER=golang:1.27
+FROM ${BASE_IMAGE_GO_BUILDER} AS builder
 ARG TARGETOS
 ARG TARGETARCH
 ARG GCFLAGS
@@ -46,6 +47,10 @@ RUN grep -rlE 'doca-repo-prod\.nvidia\.com' /etc/apt/ 2>/dev/null | xargs -r rm 
 RUN apt-get update -y
 RUN apt-get install -y --no-install-recommends ${PACKAGES}
 RUN apt-get source ${PACKAGES}
+
+# Work around DMS selecting switchdev representors instead of PF uplinks.
+COPY scripts/dms/ /tmp/nco-dms-workaround/
+RUN bash /tmp/nco-dms-workaround/patch-netdev-resolver.sh && rm -rf /tmp/nco-dms-workaround
 
 WORKDIR /
 COPY --from=builder /workspace/build/nic-configuration-daemon .

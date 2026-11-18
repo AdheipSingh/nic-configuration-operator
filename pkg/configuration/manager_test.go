@@ -17,11 +17,14 @@ package configuration
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"github.com/stretchr/testify/mock"
+	execUtils "k8s.io/utils/exec"
+	execTesting "k8s.io/utils/exec/testing"
 
 	"github.com/Mellanox/nic-configuration-operator/api/v1alpha1"
 	"github.com/Mellanox/nic-configuration-operator/pkg/configuration/mocks"
@@ -48,6 +51,7 @@ type xpathNVConfigUtils struct {
 	nvconfig.NVConfigUtils
 	validationResults []xpathValidationResult
 	validationCalls   []xpathValidationCall
+	overrideCalls     []xpathOverrideCall
 	applyResult       *xpathApplyResult
 	applyCalls        []xpathApplyCall
 }
@@ -61,6 +65,11 @@ type xpathValidationResult struct {
 type xpathValidationCall struct {
 	ports      []v1alpha1.NicDevicePortSpec
 	operations []dmscli.XPathOperation
+}
+
+type xpathOverrideCall struct {
+	params  map[string]string
+	configs map[string]types.NvConfigQuery
 }
 
 type xpathApplyResult struct {
@@ -105,6 +114,17 @@ func (u *xpathNVConfigUtils) ValidateNvConfigXPaths(
 	return result.updateNeeded, result.rebootNeeded, result.err
 }
 
+func (u *xpathNVConfigUtils) ValidateNvConfigXPathsWithOverrides(
+	ctx context.Context,
+	ports []v1alpha1.NicDevicePortSpec,
+	operations []dmscli.XPathOperation,
+	nativeParams map[string]string,
+	configs map[string]types.NvConfigQuery,
+) (bool, bool, error) {
+	u.overrideCalls = append(u.overrideCalls, xpathOverrideCall{params: nativeParams, configs: configs})
+	return u.ValidateNvConfigXPaths(ctx, ports, operations)
+}
+
 func (u *xpathNVConfigUtils) SetNvConfigParametersBatchWithXPaths(
 	ctx context.Context,
 	port v1alpha1.NicDevicePortSpec,
@@ -147,7 +167,7 @@ func (m *systemConfParamsProviderMock) GetSystemConfParams(
 var _ = Describe("ConfigurationManager", func() {
 	DescribeTable("compares normalized mlxconfig values",
 		func(actual, desired string, expected bool) {
-			Expect(mlxConfigValuesEqual(actual, desired)).To(Equal(expected))
+			Expect(nvconfig.ValueMatches([]string{actual}, desired)).To(Equal(expected))
 		},
 		Entry("case-insensitive symbolic values", "ETH", "eth", true),
 		Entry("prefixed and bare hexadecimal values", "0xFF", "FF", true),
@@ -196,30 +216,6 @@ var _ = Describe("ConfigurationManager", func() {
 			Expect(diff.unsupported).To(Equal([]string{"UNSUPPORTED"}))
 		})
 
-		It("combines changes found on any queried port", func() {
-			changed, hasUnsupported := buildCombinedNVConfigApplyDiff(map[string]types.NvConfigQuery{
-				"0000:3b:00.0": {
-					NextBootConfig: map[string][]string{"A": {"requested"}, "B": {"old"}},
-				},
-				"0000:3b:00.1": {
-					NextBootConfig: map[string][]string{"A": {"old"}, "B": {"requested"}},
-				},
-			}, map[string]string{"A": "requested", "B": "requested"}, false, false, false)
-
-			Expect(changed).To(Equal(map[string]string{"A": "requested", "B": "requested"}))
-			Expect(hasUnsupported).To(BeFalse())
-		})
-
-		It("includes matching raw values when a typed operation can overwrite them", func() {
-			changed, hasUnsupported := buildCombinedNVConfigApplyDiff(map[string]types.NvConfigQuery{
-				"0000:3b:00.0": {
-					NextBootConfig: map[string][]string{"RAW_OVERRIDE": {"requested"}},
-				},
-			}, map[string]string{"RAW_OVERRIDE": "requested"}, false, false, true)
-
-			Expect(changed).To(Equal(map[string]string{"RAW_OVERRIDE": "requested"}))
-			Expect(hasUnsupported).To(BeFalse())
-		})
 	})
 
 	Describe("extrapolatePortParamsFromNumOfPF", func() {
@@ -1540,18 +1536,6 @@ var _ = Describe("ConfigurationManager", func() {
 				Expect(err.Error()).To(ContainSubstring("config not found"))
 			})
 
-			It("rejects Network Bay before querying device state", func() {
-				device.Spec.Configuration.Template.NetworkBay = &v1alpha1.NetworkBaySpec{Conf: "conf3"}
-
-				updateNeeded, rebootNeeded, unsupported, err := manager.ValidateDeviceNvSpec(ctx, device)
-
-				Expect(err).To(MatchError(ContainSubstring(
-					"networkBay cannot currently be combined with spectrumXOptimized")))
-				Expect(updateNeeded).To(BeFalse())
-				Expect(rebootNeeded).To(BeFalse())
-				Expect(unsupported).To(BeNil())
-				mockNVConfigUtils.AssertNotCalled(GinkgoT(), "QueryNvConfig", mock.Anything, mock.Anything)
-			})
 		})
 
 		Describe("ApplyNVConfiguration", func() {
@@ -1578,6 +1562,20 @@ var _ = Describe("ConfigurationManager", func() {
 				mockNVConfigUtils.AssertNotCalled(GinkgoT(), "QueryNvConfig", mock.Anything, mock.Anything)
 			})
 
+			It("requires the optional override capability for combined native and typed intent", func() {
+				preparedPlan.Breakout = []dmscli.XPathOperation{{Path: testPCIXPath, Values: map[string]any{"num-pfs": 2}}}
+				manager.nvConfigUtils = struct {
+					nvconfig.NVConfigUtils
+					spectrumXNVConfigUtils
+				}{NVConfigUtils: mockNVConfigUtils, spectrumXNVConfigUtils: xpathUtils}
+				mockNVConfigUtils.On("QueryNvConfig", ctx, portSpec(pciAddress), []string(nil)).Return(types.NewNvConfigQuery(), nil)
+				mockConfigValidation.On("ConstructNvParamMapFromTemplate", device, mock.Anything).Return(map[string]string{"NUM_OF_PF": "4"}, nil)
+				result, err := manager.ApplyNVConfiguration(ctx, device, &types.ConfigurationOptions{})
+				Expect(err).To(MatchError(ContainSubstring("does not support doSPCX native override validation")))
+				Expect(result.Status).To(Equal(types.ApplyStatusFailed))
+				Expect(xpathUtils.applyCalls).To(BeEmpty())
+			})
+
 			It("applies native parameters and the active doSPCX phase in one batch", func() {
 				preparedPlan.Breakout = []dmscli.XPathOperation{{
 					Path: testPCIXPath, Values: map[string]any{"num-pfs": 2, "rde-disable": true},
@@ -1601,24 +1599,168 @@ var _ = Describe("ConfigurationManager", func() {
 				}}))
 			})
 
-			It("fails when a successful primary-target apply leaves native drift on a secondary PCI function", func() {
+			It("converges a raw override across apply, pending reboot, and the next reconciliation", func() {
+				const param = "ROCE_ADAPTIVE_ROUTING_EN"
+				device.Spec.Configuration.Template.RawNvConfig = []v1alpha1.NvConfigParam{{Name: param, Value: "0"}}
+				preparedPlan.Breakout = []dmscli.XPathOperation{{Path: "/nvidia/roce", Values: map[string]any{"adaptive-routing": true}}}
+				native := map[string]string{param: "0"}
+				mockConfigValidation.On("ConstructNvParamMapFromTemplate", device, mock.Anything).Return(native, nil)
+				before := types.NvConfigQuery{DefaultConfig: map[string][]string{}, CurrentConfig: map[string][]string{param: {"1"}}, NextBootConfig: map[string][]string{param: {"1"}}}
+				staged := types.NvConfigQuery{DefaultConfig: map[string][]string{}, CurrentConfig: map[string][]string{param: {"1"}}, NextBootConfig: map[string][]string{param: {"0"}}}
+				converged := types.NvConfigQuery{DefaultConfig: map[string][]string{}, CurrentConfig: map[string][]string{param: {"0"}}, NextBootConfig: map[string][]string{param: {"0"}}}
+				for _, config := range []types.NvConfigQuery{before, staged, converged} {
+					mockNVConfigUtils.On("QueryNvConfig", ctx, portSpec(pciAddress), []string(nil)).Return(config, nil).Once()
+				}
+				xpathUtils.validationResults = []xpathValidationResult{
+					{updateNeeded: true, rebootNeeded: true}, {updateNeeded: false, rebootNeeded: true}, {updateNeeded: false, rebootNeeded: false},
+				}
+				xpathUtils.applyResult = &xpathApplyResult{status: types.ApplyStatusSuccess, err: nil}
+
+				result, err := manager.ApplyNVConfiguration(ctx, device, &types.ConfigurationOptions{})
+				Expect(err).NotTo(HaveOccurred())
+				Expect(result.Status).To(Equal(types.ApplyStatusSuccess))
+				Expect(result.RebootRequired).To(BeTrue())
+				result, err = manager.ApplyNVConfiguration(ctx, device, &types.ConfigurationOptions{})
+				Expect(err).NotTo(HaveOccurred())
+				Expect(result.Status).To(Equal(types.ApplyStatusNothingToDo))
+				Expect(result.RebootRequired).To(BeTrue())
+				result, err = manager.ApplyNVConfiguration(ctx, device, &types.ConfigurationOptions{})
+				Expect(err).NotTo(HaveOccurred())
+				Expect(result.Status).To(Equal(types.ApplyStatusNothingToDo))
+				Expect(result.RebootRequired).To(BeFalse())
+				Expect(xpathUtils.applyCalls).To(HaveLen(1))
+				Expect(xpathUtils.applyCalls[0].params).To(Equal(native))
+				Expect(xpathUtils.applyCalls[0].operations).To(Equal(preparedPlan.Breakout))
+				Expect(xpathUtils.overrideCalls).To(Equal([]xpathOverrideCall{
+					{params: native, configs: map[string]types.NvConfigQuery{pciAddress: before}},
+					{params: native, configs: map[string]types.NvConfigQuery{pciAddress: staged}},
+					{params: native, configs: map[string]types.NvConfigQuery{pciAddress: converged}},
+				}))
+			})
+
+			DescribeTable("checks override ownership before writing even with apply flags",
+				func(options types.ConfigurationOptions) {
+					preparedPlan.Breakout = []dmscli.XPathOperation{{Path: testPCIXPath, Values: map[string]any{"num-pfs": 2}}}
+					mockNVConfigUtils.On("QueryNvConfig", ctx, portSpec(pciAddress), []string(nil)).Return(types.NewNvConfigQuery(), nil)
+					mockConfigValidation.On("ConstructNvParamMapFromTemplate", device, mock.Anything).Return(map[string]string{"NUM_OF_PF": "4"}, nil)
+					xpathUtils.validationResults = []xpathValidationResult{{err: errors.New("missing mapping metadata")}}
+					result, err := manager.ApplyNVConfiguration(ctx, device, &options)
+					Expect(err).To(MatchError(ContainSubstring("missing mapping metadata")))
+					Expect(result.Status).To(Equal(types.ApplyStatusFailed))
+					Expect(xpathUtils.applyCalls).To(BeEmpty())
+				},
+				Entry("normal", types.ConfigurationOptions{}),
+				Entry("force", types.ConfigurationOptions{Force: true}),
+				Entry("defaults", types.ConfigurationOptions{WithDefault: true}),
+				Entry("force and defaults", types.ConfigurationOptions{Force: true, WithDefault: true}),
+			)
+
+			It("continues past an unchanged function to the function with typed drift", func() {
 				device.Status.Ports = append(device.Status.Ports, portSpec(pciAddress2))
-				mockNVConfigUtils.On("QueryNvConfig", ctx, portSpec(pciAddress), []string(nil)).Return(
-					types.NvConfigQuery{NextBootConfig: map[string][]string{"NUM_OF_PF": {"2"}}}, nil)
-				mockNVConfigUtils.On("QueryNvConfig", ctx, portSpec(pciAddress2), []string(nil)).Return(
-					types.NvConfigQuery{NextBootConfig: map[string][]string{"NUM_OF_PF": {"1"}}}, nil)
-				mockConfigValidation.On("ConstructNvParamMapFromTemplate", device, mock.Anything).
-					Return(map[string]string{"NUM_OF_PF": "2"}, nil)
-				xpathUtils.applyResult = &xpathApplyResult{status: types.ApplyStatusSuccess}
+				preparedPlan.Breakout = []dmscli.XPathOperation{{Path: testPCIXPath, Values: map[string]any{"num-pfs": 2}}}
+				for _, port := range device.Status.Ports {
+					mockNVConfigUtils.On("QueryNvConfig", ctx, port, []string(nil)).Return(types.NewNvConfigQuery(), nil)
+				}
+				mockConfigValidation.On("ConstructNvParamMapFromTemplate", device, mock.Anything).Return(map[string]string{}, nil)
+				xpathUtils.validationResults = []xpathValidationResult{
+					{updateNeeded: true, rebootNeeded: true}, {updateNeeded: false}, {updateNeeded: true, rebootNeeded: true},
+				}
+				xpathUtils.applyResult = &xpathApplyResult{status: types.ApplyStatusNothingToDo, err: nil}
 
 				result, err := manager.ApplyNVConfiguration(ctx, device, &types.ConfigurationOptions{})
 
 				Expect(result.Status).To(Equal(types.ApplyStatusFailed))
-				Expect(err).To(MatchError(ContainSubstring(
-					"did not stage native NVConfig on secondary PCI function \"0000:3b:00.1\"")))
+				Expect(err).To(MatchError(ContainSubstring("PCI function \"" + pciAddress2 + "\" did not stage")))
+				Expect(xpathUtils.applyCalls).To(HaveLen(2))
+				Expect(xpathUtils.applyCalls[1].port.PCI).To(Equal(pciAddress2))
 			})
 
-			It("fails when a successful primary-target apply leaves typed drift on a secondary PCI function", func() {
+			It("refreshes shared native state before judging no-op responses", func() {
+				device.Status.Ports = append(device.Status.Ports, portSpec(pciAddress2))
+				before := types.NvConfigQuery{NextBootConfig: map[string][]string{"SHARED": {"1"}}}
+				staged := types.NvConfigQuery{CurrentConfig: map[string][]string{"SHARED": {"2"}}, NextBootConfig: map[string][]string{"SHARED": {"2"}}}
+				for _, port := range device.Status.Ports {
+					mockNVConfigUtils.On("QueryNvConfig", ctx, port, []string(nil)).Return(before, nil).Once()
+					mockNVConfigUtils.On("QueryNvConfig", ctx, port, []string(nil)).Return(staged, nil).Once()
+				}
+				mockConfigValidation.On("ConstructNvParamMapFromTemplate", device, mock.Anything).Return(map[string]string{"SHARED": "2"}, nil)
+				xpathUtils.applyResult = &xpathApplyResult{status: types.ApplyStatusNothingToDo, err: nil}
+
+				result, err := manager.ApplyNVConfiguration(ctx, device, &types.ConfigurationOptions{})
+
+				Expect(err).NotTo(HaveOccurred())
+				Expect(result.Status).To(Equal(types.ApplyStatusNothingToDo))
+				Expect(xpathUtils.applyCalls).To(HaveLen(2))
+			})
+
+			It("keeps native parameter support separate for each PCI function", func() {
+				device.Status.Ports = append(device.Status.Ports, portSpec(pciAddress2))
+				first := types.NvConfigQuery{NextBootConfig: map[string][]string{"FIRST": {"0"}}}
+				second := types.NvConfigQuery{NextBootConfig: map[string][]string{"SECOND": {"0"}}}
+				staged := types.NvConfigQuery{NextBootConfig: map[string][]string{"SECOND": {"1"}}}
+				mockNVConfigUtils.On("QueryNvConfig", ctx, portSpec(pciAddress), []string(nil)).Return(first, nil).Once()
+				mockNVConfigUtils.On("QueryNvConfig", ctx, portSpec(pciAddress2), []string(nil)).Return(second, nil).Once()
+				mockNVConfigUtils.On("QueryNvConfig", ctx, portSpec(pciAddress2), []string(nil)).Return(staged, nil).Once()
+				mockNVConfigUtils.On("QueryNvConfig", ctx, portSpec(pciAddress), []string(nil)).Return(types.NvConfigQuery{NextBootConfig: map[string][]string{"FIRST": {"1"}}}, nil).Once()
+				mockConfigValidation.On("ConstructNvParamMapFromTemplate", device, mock.Anything).
+					Return(map[string]string{"FIRST": "1", "SECOND": "1"}, nil)
+				xpathUtils.applyResult = &xpathApplyResult{status: types.ApplyStatusSuccess, err: nil}
+
+				result, err := manager.ApplyNVConfiguration(ctx, device, &types.ConfigurationOptions{})
+
+				Expect(err).NotTo(HaveOccurred())
+				Expect(result.Status).To(Equal(types.ApplyStatusPartiallyApplied))
+				Expect(result.RebootRequired).To(BeTrue())
+				Expect(xpathUtils.applyCalls).To(HaveLen(2))
+				Expect(xpathUtils.applyCalls[0].port.PCI).To(Equal(pciAddress))
+				Expect(xpathUtils.applyCalls[0].params).To(Equal(map[string]string{"FIRST": "1"}))
+				Expect(xpathUtils.applyCalls[1].port.PCI).To(Equal(pciAddress2))
+				Expect(xpathUtils.applyCalls[1].params).To(Equal(map[string]string{"SECOND": "1"}))
+			})
+
+			It("refreshes overridden native state before verifying secondary functions", func() {
+				device.Status.Ports = append(device.Status.Ports, portSpec(pciAddress2))
+				preparedPlan.Breakout = []dmscli.XPathOperation{{Path: testPCIXPath, Values: map[string]any{"num-pfs": 2}}}
+				native := map[string]string{"NUM_OF_PF": "4"}
+				before := types.NvConfigQuery{DefaultConfig: map[string][]string{}, CurrentConfig: map[string][]string{"NUM_OF_PF": {"2"}}, NextBootConfig: map[string][]string{"NUM_OF_PF": {"2"}}}
+				staged := types.NvConfigQuery{DefaultConfig: map[string][]string{}, CurrentConfig: map[string][]string{"NUM_OF_PF": {"2"}}, NextBootConfig: map[string][]string{"NUM_OF_PF": {"4"}}}
+				for _, port := range device.Status.Ports {
+					mockNVConfigUtils.On("QueryNvConfig", ctx, port, []string(nil)).Return(before, nil).Once()
+				}
+				mockNVConfigUtils.On("QueryNvConfig", ctx, portSpec(pciAddress), []string(nil)).Return(staged, nil).Once()
+				mockNVConfigUtils.On("QueryNvConfig", ctx, portSpec(pciAddress2), []string(nil)).Return(staged, nil).Once()
+				mockConfigValidation.On("ConstructNvParamMapFromTemplate", device, mock.Anything).Return(native, nil)
+				xpathUtils.validationResults = []xpathValidationResult{{updateNeeded: true, rebootNeeded: true}, {updateNeeded: false, rebootNeeded: true}}
+				xpathUtils.applyResult = &xpathApplyResult{status: types.ApplyStatusSuccess, err: nil}
+				result, err := manager.ApplyNVConfiguration(ctx, device, &types.ConfigurationOptions{})
+				Expect(err).NotTo(HaveOccurred())
+				Expect(result.Status).To(Equal(types.ApplyStatusSuccess))
+				Expect(xpathUtils.overrideCalls).To(HaveLen(2))
+				Expect(xpathUtils.overrideCalls[1]).To(Equal(xpathOverrideCall{params: native, configs: map[string]types.NvConfigQuery{pciAddress: staged, pciAddress2: staged}}))
+			})
+
+			DescribeTable("checks native pending state on every function after the last write",
+				func(driftPCI string) {
+					device.Status.Ports = append(device.Status.Ports, portSpec(pciAddress2))
+					for _, port := range device.Status.Ports {
+						value := "2"
+						if port.PCI == driftPCI {
+							value = "1"
+						}
+						mockNVConfigUtils.On("QueryNvConfig", ctx, port, []string(nil)).Return(
+							types.NvConfigQuery{NextBootConfig: map[string][]string{"NUM_OF_PF": {value}}}, nil)
+					}
+					mockConfigValidation.On("ConstructNvParamMapFromTemplate", device, mock.Anything).Return(map[string]string{"NUM_OF_PF": "2"}, nil)
+					xpathUtils.applyResult = &xpathApplyResult{status: types.ApplyStatusSuccess, err: nil}
+					result, err := manager.ApplyNVConfiguration(ctx, device, &types.ConfigurationOptions{})
+					Expect(result.Status).To(Equal(types.ApplyStatusFailed))
+					Expect(err).To(MatchError(ContainSubstring("did not stage native NVConfig on PCI function \"" + driftPCI + "\"")))
+				},
+				Entry("primary", pciAddress),
+				Entry("secondary", pciAddress2),
+			)
+
+			It("fails when a successful per-function apply leaves typed drift on a secondary PCI function", func() {
 				device.Status.Ports = append(device.Status.Ports, portSpec(pciAddress2))
 				preparedPlan.Breakout = []dmscli.XPathOperation{{
 					Path: testPCIXPath, Values: map[string]any{"num-pfs": 2},
@@ -1638,26 +1780,13 @@ var _ = Describe("ConfigurationManager", func() {
 
 				Expect(result.Status).To(Equal(types.ApplyStatusFailed))
 				Expect(err).To(MatchError(ContainSubstring(
-					"did not stage typed NVConfig on every secondary PCI function")))
+					"did not stage typed NVConfig on every PCI function")))
 				Expect(xpathUtils.validationCalls).To(HaveLen(2))
 				Expect(xpathUtils.validationCalls[1].ports).To(Equal(
-					[]v1alpha1.NicDevicePortSpec{portSpec(pciAddress2)}))
+					[]v1alpha1.NicDevicePortSpec{portSpec(pciAddress), portSpec(pciAddress2)}))
 			})
 
-			It("rejects rawNvConfig before querying or applying device state", func() {
-				device.Spec.Configuration.Template.RawNvConfig = []v1alpha1.NvConfigParam{{
-					Name: "ROCE_ADAPTIVE_ROUTING_EN", Value: "0",
-				}}
-
-				result, err := manager.ApplyNVConfiguration(ctx, device, &types.ConfigurationOptions{})
-
-				Expect(result.Status).To(Equal(types.ApplyStatusFailed))
-				Expect(err).To(MatchError(ContainSubstring(
-					"rawNvConfig cannot currently be combined with spectrumXOptimized")))
-				mockNVConfigUtils.AssertNotCalled(GinkgoT(), "QueryNvConfig", mock.Anything, mock.Anything)
-			})
-
-			It("force applies the complete plan once through the primary target with every available DMS port", func() {
+			It("force applies the complete plan to each PCI function using local port 1", func() {
 				device.Status.Ports = append(device.Status.Ports, portSpec(pciAddress2))
 				preparedPlan.Breakout = []dmscli.XPathOperation{{
 					Path: testPCIXPath, Values: map[string]any{"num-pfs": 2},
@@ -1680,12 +1809,17 @@ var _ = Describe("ConfigurationManager", func() {
 				Expect(result.Status).To(Equal(types.ApplyStatusSuccess))
 				Expect(result.RebootRequired).To(BeTrue())
 				Expect(xpathUtils.validationCalls).To(Equal([]xpathValidationCall{{
-					ports: []v1alpha1.NicDevicePortSpec{portSpec(pciAddress2)},
+					ports: []v1alpha1.NicDevicePortSpec{portSpec(pciAddress), portSpec(pciAddress2)},
 					operations: append(
 						append([]dmscli.XPathOperation{}, preparedPlan.Breakout...), preparedPlan.PostBreakout...),
 				}}))
-				Expect(xpathUtils.applyCalls).To(HaveLen(1))
-				Expect(xpathUtils.applyCalls[0].portCount).To(Equal(2))
+				Expect(xpathUtils.applyCalls).To(HaveLen(2))
+				Expect(xpathUtils.applyCalls[0].portCount).To(Equal(1))
+				Expect(xpathUtils.applyCalls[1].portCount).To(Equal(1))
+				Expect(xpathUtils.applyCalls[0].port.PCI).To(Equal(pciAddress))
+				Expect(xpathUtils.applyCalls[1].port.PCI).To(Equal(pciAddress2))
+				Expect(xpathUtils.applyCalls[1].operations).To(Equal(xpathUtils.applyCalls[0].operations))
+				Expect(xpathUtils.applyCalls[1].force).To(BeTrue())
 				Expect(xpathUtils.applyCalls[0].operations).To(Equal(
 					append(preparedPlan.Breakout, preparedPlan.PostBreakout...)))
 				Expect(xpathUtils.applyCalls[0].force).To(BeTrue())
@@ -1892,6 +2026,176 @@ var _ = Describe("ConfigurationManager", func() {
 				NextBootConfig: map[string][]string{"BOARD_CONFIGURATION_MODE": {"1"}},
 				DefaultConfig:  map[string][]string{},
 			}
+		})
+
+		Context("with doSPCX", func() {
+			var plan *spectrumx.Plan
+			var xpathUtils *xpathNVConfigUtils
+			var executor *execTesting.FakeExec
+			var mappings map[string]string
+			var profile map[string]string
+
+			BeforeEach(func() {
+				device.Spec.Configuration.Template.SpectrumXOptimized = &v1alpha1.SpectrumXOptimizedSpec{Enabled: true}
+				plan = &spectrumx.Plan{
+					Breakout: []dmscli.XPathOperation{
+						{Path: testPCIXPath, Values: map[string]any{"num-pfs": 2}},
+						{Path: "/nvidia/link/breakout/module/[0]/port/[1]", Values: map[string]any{"lanes": []int{0, 1}}},
+					},
+					PostBreakout: []dmscli.XPathOperation{{Path: testPCIXPath, Values: map[string]any{"num-vfs": 1}}},
+				}
+				spcx := spcxmocks.NewSpectrumXManager(GinkgoT())
+				spcx.On("GetPreparedPlan", device).Return(plan, nil)
+				manager.spectrumXConfigManager = spcx
+				xpathUtils = &xpathNVConfigUtils{NVConfigUtils: mockNV,
+					applyResult: &xpathApplyResult{status: types.ApplyStatusSuccess, err: nil}}
+				manager.nvConfigUtils = xpathUtils
+				mappings = map[string]string{
+					testPCIXPath + "/num-pfs": "NUM_OF_PF", testPCIXPath + "/num-pfs-pending": "NUM_OF_PF",
+					testPCIXPath + "/num-vfs": "NUM_OF_VFS", testPCIXPath + "/num-vfs-pending": "NUM_OF_VFS",
+				}
+				executor = &execTesting.FakeExec{DisableScripts: false}
+				manager.execInterface = executor
+				profile = map[string]string{"NUM_OF_PF": "4", "NUM_OF_VFS": "8",
+					"MODULE_SPLIT_M0[0]": "FF", "MODULE_SPLIT_M0[1]": "FF", "MODULE_SPLIT_M0[7]": "FF"}
+				mockSystemConf.On("GetSystemConfParams", ctx, portSpec(pciAddress), "conf3", 0).Return(profile, nil)
+				nvConfig = types.NewNvConfigQuery()
+				nvConfig.CurrentConfig = map[string][]string{"NUM_OF_PF": {"1"}, "NUM_OF_VFS": {"8"},
+					"MODULE_SPLIT_M0[0]": {"255"}, "MODULE_SPLIT_M0[1]": {"255"}, "MODULE_SPLIT_M0[7]": {"255"}}
+				nvConfig.NextBootConfig = map[string][]string{"NUM_OF_PF": {"1"}, "NUM_OF_VFS": {"8"},
+					"MODULE_SPLIT_M0[0]": {"255"}, "MODULE_SPLIT_M0[1]": {"255"}, "MODULE_SPLIT_M0[7]": {"255"}}
+				mockNV.On("QueryNvConfig", ctx, portSpec(pciAddress), []string(nil)).Return(nvConfig, nil)
+			})
+
+			addMetadata := func() {
+				data, err := json.Marshal(map[string]any{"_nvconfig": mappings})
+				Expect(err).NotTo(HaveOccurred())
+				executor.CommandScript = append(executor.CommandScript, func(_ string, _ ...string) execUtils.Cmd {
+					return &execTesting.FakeCmd{RunScript: []execTesting.FakeAction{func() ([]byte, []byte, error) {
+						return data, nil, nil
+					}}}
+				})
+			}
+
+			DescribeTable("preserves profile < typed < explicit precedence in the combined payload",
+				func(force, withDefault bool) {
+					addMetadata()
+					mockConfigValidation.On("ConstructNvParamMapFromTemplate", device, nvConfig).
+						Return(map[string]string{"MODULE_SPLIT_M0[1]": "2"}, nil)
+					xpathUtils.validationResults = []xpathValidationResult{{updateNeeded: true, rebootNeeded: true, err: nil}}
+					result, err := manager.ApplyNVConfiguration(ctx, device,
+						&types.ConfigurationOptions{Force: force, WithDefault: withDefault, SkipReset: true})
+					Expect(err).NotTo(HaveOccurred())
+					Expect(result.RebootRequired).To(BeTrue())
+					Expect(xpathUtils.applyCalls).To(HaveLen(1))
+					Expect(xpathUtils.applyCalls[0].params).To(Equal(map[string]string{
+						"MODULE_SPLIT_M0[1]": "2", "MODULE_SPLIT_M0[7]": "FF"}))
+					expectedOps := plan.Breakout
+					if force {
+						expectedOps = append(append([]dmscli.XPathOperation{}, plan.Breakout...), plan.PostBreakout...)
+					}
+					Expect(xpathUtils.applyCalls[0].operations).To(Equal(expectedOps))
+					Expect(profile["MODULE_SPLIT_M0[1]"]).To(Equal("FF"))
+				}, Entry("ordinary apply", false, false), Entry("force", true, false), Entry("with-default", false, true))
+
+			It("does not reintroduce typed-owned profile defaults during Force expansion", func() {
+				profile["FOO_P1"] = "1"
+				profile["FOO_P2"] = "1"
+				plan.PostBreakout[0].Values["foo"] = 2
+				mappings[testPCIXPath+"/foo"] = "FOO_P2"
+				mappings[testPCIXPath+"/foo-pending"] = "FOO_P2"
+				addMetadata()
+				mockConfigValidation.On("ConstructNvParamMapFromTemplate", device, nvConfig).
+					Return(map[string]string{"NUM_OF_PF": "2", "BAR_P1": "3"}, nil)
+				xpathUtils.validationResults = []xpathValidationResult{{}}
+				_, err := manager.ApplyNVConfiguration(ctx, device, &types.ConfigurationOptions{Force: true})
+				Expect(err).NotTo(HaveOccurred())
+				Expect(xpathUtils.applyCalls).To(HaveLen(1))
+				Expect(xpathUtils.applyCalls[0].params).NotTo(HaveKey("FOO_P2"))
+				Expect(xpathUtils.applyCalls[0].params).To(HaveKeyWithValue("FOO_P1", "1"))
+				Expect(xpathUtils.applyCalls[0].params).To(HaveKeyWithValue("BAR_P2", "3"))
+			})
+
+			DescribeTable("preserves explicit sibling-port settings after forced apply",
+				func(overrideSibling bool, expectedSibling string) {
+					profile["NUM_OF_PF"] = "2"
+					profile["KEEP_ETH_LINK_UP_P1"] = "1"
+					profile["KEEP_ETH_LINK_UP_P2"] = "1"
+					overrides := map[string]string{"KEEP_ETH_LINK_UP_P1": "0"}
+					if overrideSibling {
+						overrides["KEEP_ETH_LINK_UP_P2"] = "0"
+					}
+					mockConfigValidation.On("ConstructNvParamMapFromTemplate", device, mock.Anything).Return(overrides, nil)
+					for range 3 {
+						addMetadata()
+					}
+					xpathUtils.validationResults = []xpathValidationResult{{}, {}, {}, {}, {}}
+					_, err := manager.ApplyNVConfiguration(ctx, device, &types.ConfigurationOptions{Force: true})
+					Expect(err).NotTo(HaveOccurred())
+					Expect(xpathUtils.applyCalls).To(HaveLen(1))
+					applied := xpathUtils.applyCalls[0].params
+					Expect(applied).To(HaveKeyWithValue("KEEP_ETH_LINK_UP_P1", "0"))
+					Expect(applied).To(HaveKeyWithValue("KEEP_ETH_LINK_UP_P2", expectedSibling))
+
+					// Model the forced native batch taking effect after reboot. Ordinary
+					// reconciliation must accept it instead of restoring the sibling port.
+					for param, value := range applied {
+						nvConfig.CurrentConfig[param] = []string{value}
+						nvConfig.NextBootConfig[param] = []string{value}
+					}
+					update, reboot, unsupported, err := manager.ValidateDeviceNvSpec(ctx, device)
+					Expect(err).NotTo(HaveOccurred())
+					Expect(update).To(BeFalse())
+					Expect(reboot).To(BeFalse())
+					Expect(unsupported).To(BeEmpty())
+					result, err := manager.ApplyNVConfiguration(ctx, device, &types.ConfigurationOptions{})
+					Expect(err).NotTo(HaveOccurred())
+					Expect(result.Status).To(Equal(types.ApplyStatusNothingToDo))
+					Expect(result.RebootRequired).To(BeFalse())
+					Expect(xpathUtils.applyCalls).To(HaveLen(1))
+					Expect(profile["KEEP_ETH_LINK_UP_P1"]).To(Equal("1"))
+					Expect(profile["KEEP_ETH_LINK_UP_P2"]).To(Equal("1"))
+				},
+				Entry("profile sibling value survives inferred override", false, "1"),
+				Entry("explicit sibling override still wins", true, "0"))
+
+			It("resends both phases with filtered defaults during post-breakout WithDefault", func() {
+				addMetadata()
+				mockConfigValidation.On("ConstructNvParamMapFromTemplate", device, nvConfig).Return(map[string]string{}, nil)
+				xpathUtils.validationResults = []xpathValidationResult{{}, {updateNeeded: true, rebootNeeded: true}}
+				_, err := manager.ApplyNVConfiguration(ctx, device, &types.ConfigurationOptions{WithDefault: true})
+				Expect(err).NotTo(HaveOccurred())
+				Expect(xpathUtils.applyCalls).To(HaveLen(1))
+				Expect(xpathUtils.applyCalls[0].params).To(Equal(map[string]string{"MODULE_SPLIT_M0[7]": "FF"}))
+				Expect(xpathUtils.applyCalls[0].operations).To(Equal(
+					append(append([]dmscli.XPathOperation{}, plan.Breakout...), plan.PostBreakout...)))
+			})
+
+			It("does not rewrite shadowed profile defaults after convergence", func() {
+				addMetadata()
+				addMetadata()
+				mockConfigValidation.On("ConstructNvParamMapFromTemplate", device, nvConfig).Return(map[string]string{}, nil)
+				xpathUtils.validationResults = []xpathValidationResult{{}, {}, {}, {}}
+				update, reboot, unsupported, err := manager.ValidateDeviceNvSpec(ctx, device)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(update).To(BeFalse())
+				Expect(reboot).To(BeFalse())
+				Expect(unsupported).To(BeEmpty())
+				result, err := manager.ApplyNVConfiguration(ctx, device, &types.ConfigurationOptions{})
+				Expect(err).NotTo(HaveOccurred())
+				Expect(result.Status).To(Equal(types.ApplyStatusNothingToDo))
+				Expect(result.RebootRequired).To(BeFalse())
+				Expect(xpathUtils.applyCalls).To(BeEmpty())
+			})
+
+			It("fails before writes when profile ownership cannot be resolved", func() {
+				delete(mappings, testPCIXPath+"/num-pfs-pending")
+				addMetadata()
+				mockConfigValidation.On("ConstructNvParamMapFromTemplate", device, nvConfig).Return(map[string]string{}, nil)
+				_, err := manager.ApplyNVConfiguration(ctx, device, &types.ConfigurationOptions{Force: true})
+				Expect(err).To(MatchError(ContainSubstring("mapping metadata is required")))
+				Expect(xpathUtils.applyCalls).To(BeEmpty())
+			})
 		})
 
 		It("validates profile parameters as regular NVConfig values", func() {

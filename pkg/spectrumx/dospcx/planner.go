@@ -21,6 +21,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -58,11 +59,13 @@ const (
 	planStageConfigure planStage = "configure"
 )
 
-// Plan is the homogeneous configuration intent compiled from doSPCX plans.
+// Plan is the configuration intent selected for one NIC from doSPCX plans.
 type Plan struct {
 	Breakout      []dmscli.XPathOperation
 	PostBreakout  []dmscli.XPathOperation
 	RuntimeConfig []OperationGroup
+	// ConfigureError records a deferred configure plan; runtime configuration must not proceed.
+	ConfigureError error
 }
 
 // OperationGroup is an ordered group of runtime configuration operations.
@@ -105,11 +108,12 @@ type targetMapTarget struct {
 }
 
 type preBreakoutTarget struct {
-	ID       string `json:"id"`
-	BDF      string `json:"bdf"`
-	DeviceID string `json:"device_id"`
-	Role     string `json:"role"`
-	Rail     int    `json:"rail"`
+	ID             string `json:"id"`
+	BDF            string `json:"bdf"`
+	DeviceID       string `json:"device_id"`
+	Role           string `json:"role"`
+	Rail           int    `json:"rail"`
+	NicIndexInRail *int   `json:"nic_index_in_rail,omitempty"`
 }
 
 type planConfig struct {
@@ -120,7 +124,12 @@ type planConfig struct {
 	multiplane   string
 	overlay      string
 	planes       int
-	targetMap    targetMap
+	devices      []planDevice
+}
+
+type planDevice struct {
+	bdf      string
+	deviceID string
 }
 
 // planMetadata contains only the inputs used to generate a doSPCX plan.
@@ -145,17 +154,18 @@ type planMetadata struct {
 type preparedPlan struct {
 	metadata  map[planStage]planMetadata
 	targetMap targetMap
-	plan      *Plan
+	plan      *compiledPlan
 }
 
 type preparedStagePlan struct {
 	metadata  planMetadata
 	targetMap targetMap
-	plan      *Plan
+	plan      *compiledPlan
 }
 
 // PreparePlan ensures that one matching node-scoped plan containing persistent
-// and runtime configuration is cached. It is a no-op when none of the devices
+// and runtime configuration is cached. Configure planning may be deferred until
+// prepare NVConfig establishes the required topology. It is a no-op when none of the devices
 // enable Spectrum-X.
 func (m *Manager) PreparePlan(
 	ctx context.Context,
@@ -184,8 +194,22 @@ func (m *Manager) PreparePlan(
 	m.planMutex.Lock()
 	defer m.planMutex.Unlock()
 
+	cacheKey := targetMapName(config.nodeName)
+	cached := m.preparedPlans[cacheKey]
+	// Publish only a successfully prepared or explicitly deferred replacement.
+	delete(m.preparedPlans, cacheKey)
+	var targets targetMap
+	if config.platformType == "vr" {
+		targets, err = m.loadVRTargetMap(config.devices)
+		if err != nil {
+			return err
+		}
+	} else {
+		targets = buildTargetMap(config)
+	}
+
 	targetMapPath := filepath.Join(stateDir, "target-maps", targetMapName(config.nodeName)+".json")
-	targetMapContent, err := marshalJSONFile(config.targetMap)
+	targetMapContent, err := marshalJSONFile(targets)
 	if err != nil {
 		return fmt.Errorf("marshal doSPCX target map: %w", err)
 	}
@@ -197,14 +221,22 @@ func (m *Manager) PreparePlan(
 		m.preparedPlans = make(map[string]*preparedPlan)
 	}
 
-	cacheKey := targetMapName(config.nodeName)
-	cached := m.preparedPlans[cacheKey]
 	stagePlans := make(map[planStage]*preparedStagePlan, 2)
 	for _, stage := range []planStage{planStagePrepare, planStageConfigure} {
 		stagePlan, stageErr := m.prepareStagePlan(
-			ctx, config, params, stateDir, targetMapPath, targetMapDigest, stage, cached)
+			ctx, config, targets, params, stateDir, targetMapPath, targetMapDigest, stage, cached)
 		if stageErr != nil {
-			return fmt.Errorf("prepare doSPCX %s plan: %w", stage, stageErr)
+			wrappedErr := fmt.Errorf("prepare doSPCX %s plan: %w", stage, stageErr)
+			var unavailable *dmscli.BlueprintTargetUnavailableError
+			if stage == planStageConfigure && ctx.Err() == nil && errors.As(stageErr, &unavailable) {
+				deferred := combineStagePlans(stagePlans[planStagePrepare], nil)
+				deferred.plan.ConfigureError = wrappedErr
+				m.preparedPlans[cacheKey] = deferred
+				log.FromContext(ctx).Info("deferring doSPCX configure plan until prepare configuration is applied",
+					"node", config.nodeName, "error", wrappedErr.Error())
+				return nil
+			}
+			return wrappedErr
 		}
 		stagePlans[stage] = stagePlan
 	}
@@ -218,6 +250,7 @@ func (m *Manager) PreparePlan(
 func (m *Manager) prepareStagePlan(
 	ctx context.Context,
 	config *planConfig,
+	targets targetMap,
 	params []string,
 	stateDir string,
 	targetMapPath string,
@@ -268,9 +301,9 @@ func (m *Manager) prepareStagePlan(
 	}
 	log.FromContext(ctx).Info("generated doSPCX plan",
 		"node", config.nodeName, "stage", stage, "profile", config.profile,
-		"platformType", config.platformType, "devices", len(config.targetMap.PreBreakout.Targets),
+		"platformType", config.platformType, "devices", len(config.devices),
 		"targetMap", targetMapPath, "plan", planPath, "metadata", metadataPath)
-	return &preparedStagePlan{metadata: metadata, targetMap: config.targetMap, plan: plan}, nil
+	return &preparedStagePlan{metadata: metadata, targetMap: targets, plan: plan}, nil
 }
 
 // GetPreparedPlan retrieves a cached plan only when it still matches the
@@ -305,6 +338,9 @@ func (m *Manager) GetPreparedPlan(device *v1alpha1.NicDevice) (*Plan, error) {
 		return nil, fmt.Errorf("doSPCX plan is not prepared for device %q", device.Name)
 	}
 	for _, stage := range []planStage{planStagePrepare, planStageConfigure} {
+		if stage == planStageConfigure && cached.plan.ConfigureError != nil {
+			continue
+		}
 		metadata, metadataFound := cached.metadata[stage]
 		if !metadataFound || metadata.TargetMapDigest == "" {
 			return nil, fmt.Errorf("cached doSPCX plan is incomplete for device %q", device.Name)
@@ -315,38 +351,41 @@ func (m *Manager) GetPreparedPlan(device *v1alpha1.NicDevice) (*Plan, error) {
 			return nil, fmt.Errorf("cached doSPCX plan does not match device %q inputs", device.Name)
 		}
 	}
-	if err := validateDeviceInTargetMap(config, cached.targetMap); err != nil {
+	target, err := deviceInTargetMap(config, cached.targetMap)
+	if err != nil {
 		return nil, fmt.Errorf("cached doSPCX plan does not match device %q: %w", device.Name, err)
 	}
-	return clonePlan(cached.plan), nil
+	return projectPlan(cached.plan, target, config.platformType)
 }
 
 func combineStagePlans(prepare, configure *preparedStagePlan) *preparedPlan {
-	return &preparedPlan{
-		metadata: map[planStage]planMetadata{
-			planStagePrepare:   prepare.metadata,
-			planStageConfigure: configure.metadata,
-		},
+	combined := &preparedPlan{
+		metadata:  map[planStage]planMetadata{planStagePrepare: prepare.metadata},
 		targetMap: prepare.targetMap,
-		plan: &Plan{
-			Breakout:      cloneXPathOperations(prepare.plan.Breakout),
-			PostBreakout:  cloneXPathOperations(prepare.plan.PostBreakout),
-			RuntimeConfig: cloneOperationGroups(configure.plan.RuntimeConfig),
+		plan: &compiledPlan{
+			Breakout:     prepare.plan.Breakout,
+			PostBreakout: prepare.plan.PostBreakout,
 		},
 	}
+	if configure != nil {
+		combined.metadata[planStageConfigure] = configure.metadata
+		combined.plan.RuntimeConfig = configure.plan.RuntimeConfig
+	}
+	return combined
 }
 
-func planForStage(plan *Plan, stage planStage) *Plan {
+// Cached compiled operations are immutable and can be shared between stage views.
+func planForStage(plan *compiledPlan, stage planStage) *compiledPlan {
 	if plan == nil {
 		return nil
 	}
 	if stage == planStagePrepare {
-		return &Plan{
-			Breakout:     cloneXPathOperations(plan.Breakout),
-			PostBreakout: cloneXPathOperations(plan.PostBreakout),
+		return &compiledPlan{
+			Breakout:     plan.Breakout,
+			PostBreakout: plan.PostBreakout,
 		}
 	}
-	return &Plan{RuntimeConfig: cloneOperationGroups(plan.RuntimeConfig)}
+	return &compiledPlan{RuntimeConfig: plan.RuntimeConfig}
 }
 
 func newPlanMetadata(
@@ -384,7 +423,7 @@ func planParameters(config *planConfig) ([]string, error) {
 	if config.overlay == "" {
 		return params, nil
 	}
-	if config.profile == dospcxProfileMultiplane {
+	if config.multiplane == consts.MultiplaneModeHwplb {
 		if config.overlay != consts.OverlayNone {
 			return nil, fmt.Errorf("doSPCX profile %s does not support overlay %q", config.profile, config.overlay)
 		}
@@ -393,26 +432,26 @@ func planParameters(config *planConfig) ([]string, error) {
 	return append(params, "overlay="+config.overlay), nil
 }
 
-func validateDeviceInTargetMap(config *planConfig, saved targetMap) error {
+func deviceInTargetMap(config *planConfig, saved targetMap) (preBreakoutTarget, error) {
 	if saved.SchemaVersion != targetMapSchemaVersion || saved.PlatformType != config.platformType {
-		return fmt.Errorf("target map identity changed")
+		return preBreakoutTarget{}, fmt.Errorf("target map identity changed")
 	}
-	expectedTarget := config.targetMap.PreBreakout.Targets[0]
+	expectedDevice := config.devices[0]
 	for _, target := range saved.PreBreakout.Targets {
-		if target.BDF == expectedTarget.BDF {
+		if target.BDF == expectedDevice.bdf {
 			if strings.TrimSpace(target.ID) == "" {
-				return fmt.Errorf("BDF %q has no target ID", expectedTarget.BDF)
+				return preBreakoutTarget{}, fmt.Errorf("BDF %q has no target ID", expectedDevice.bdf)
 			}
-			if target.DeviceID != expectedTarget.DeviceID {
-				return fmt.Errorf("BDF %q device ID is %q, expected %q", expectedTarget.BDF, target.DeviceID, expectedTarget.DeviceID)
+			if target.DeviceID != expectedDevice.deviceID {
+				return preBreakoutTarget{}, fmt.Errorf("BDF %q device ID is %q, expected %q", expectedDevice.bdf, target.DeviceID, expectedDevice.deviceID)
 			}
 			if target.Role != targetRoleEW {
-				return fmt.Errorf("BDF %q role is %q, expected %q", expectedTarget.BDF, target.Role, targetRoleEW)
+				return preBreakoutTarget{}, fmt.Errorf("BDF %q role is %q, expected %q", expectedDevice.bdf, target.Role, targetRoleEW)
 			}
-			return nil
+			return target, nil
 		}
 	}
-	return fmt.Errorf("BDF %q is absent from the target map", expectedTarget.BDF)
+	return preBreakoutTarget{}, fmt.Errorf("BDF %q is absent from the target map", expectedDevice.bdf)
 }
 
 func (m *Manager) resolvedStateDir() string {
@@ -501,7 +540,7 @@ func buildPlanConfig(devices []*v1alpha1.NicDevice) (*planConfig, error) {
 	if nodeName == "" {
 		return nil, fmt.Errorf("Spectrum-X device %q has no node name", selected[0].Name)
 	}
-	profile, err := blueprintProfile(firstSpec.MultiplaneMode)
+	profile, err := blueprintProfile(firstSpec.PlatformType, firstSpec.MultiplaneMode)
 	if err != nil {
 		return nil, err
 	}
@@ -521,24 +560,15 @@ func buildPlanConfig(devices []*v1alpha1.NicDevice) (*planConfig, error) {
 		multiplane:   normalizedMultiplaneMode(firstSpec.MultiplaneMode),
 		overlay:      firstSpec.Overlay,
 		planes:       planes,
-		targetMap: targetMap{
-			SchemaVersion: targetMapSchemaVersion,
-			PlatformType:  platformType,
-			PreBreakout:   targetMapTarget{Targets: make([]preBreakoutTarget, 0, len(selected))},
-		},
+		devices:      make([]planDevice, 0, len(selected)),
 	}
-	type orderedDevice struct {
-		bdf      string
-		deviceID string
-	}
-	ordered := make([]orderedDevice, 0, len(selected))
 	seenBDFs := map[string]string{}
 	for _, device := range selected {
 		if strings.TrimSpace(device.Status.Node) != config.nodeName {
 			return nil, fmt.Errorf("Spectrum-X devices in one plan must belong to the same node; device %q belongs to %q", device.Name, device.Status.Node)
 		}
 		spec := device.Spec.Configuration.Template.SpectrumXOptimized
-		deviceProfile, profileErr := blueprintProfile(spec.MultiplaneMode)
+		deviceProfile, profileErr := blueprintProfile(spec.PlatformType, spec.MultiplaneMode)
 		if profileErr != nil {
 			return nil, fmt.Errorf("device %q: %w", device.Name, profileErr)
 		}
@@ -573,21 +603,12 @@ func buildPlanConfig(devices []*v1alpha1.NicDevice) (*planConfig, error) {
 			return nil, fmt.Errorf("devices %q and %q resolve to the same pre-breakout BDF %q", otherDevice, device.Name, bdf)
 		}
 		seenBDFs[bdf] = device.Name
-		ordered = append(ordered, orderedDevice{bdf: bdf, deviceID: deviceID})
+		config.devices = append(config.devices, planDevice{bdf: bdf, deviceID: deviceID})
 	}
 
-	sort.Slice(ordered, func(i, j int) bool {
-		return ordered[i].bdf < ordered[j].bdf
+	sort.Slice(config.devices, func(i, j int) bool {
+		return config.devices[i].bdf < config.devices[j].bdf
 	})
-	for rail, item := range ordered {
-		config.targetMap.PreBreakout.Targets = append(config.targetMap.PreBreakout.Targets, preBreakoutTarget{
-			ID:       fmt.Sprintf("ew-rail%d-prebreakout", rail),
-			BDF:      item.bdf,
-			DeviceID: item.deviceID,
-			Role:     targetRoleEW,
-			Rail:     rail,
-		})
-	}
 
 	return config, nil
 }
@@ -616,8 +637,28 @@ func normalizedMultiplaneMode(mode string) string {
 	return mode
 }
 
-func blueprintProfile(mode string) (string, error) {
-	switch normalizedMultiplaneMode(mode) {
+func blueprintProfile(platform, mode string) (string, error) {
+	platform = strings.TrimSpace(platform)
+	mode = normalizedMultiplaneMode(mode)
+	// Platform-specific recipes are provided by the installed doSPCX data bundle.
+	// Keep the generic profiles for other platforms, including custom bundles.
+	switch platform {
+	case "rtx":
+		if mode == consts.MultiplaneModeNone {
+			return "rtx", nil
+		}
+		return "", fmt.Errorf("platform %q does not support multiplaneMode %q", platform, mode)
+	case "vr":
+		switch mode {
+		case consts.MultiplaneModeSwplb:
+			return "vr-SPX_NetPlugin", nil
+		case consts.MultiplaneModeHwplb:
+			return "vr-SPX_Multiplane", nil
+		default:
+			return "", fmt.Errorf("platform %q does not support multiplaneMode %q", platform, mode)
+		}
+	}
+	switch mode {
 	case consts.MultiplaneModeNone:
 		return dospcxProfileSinglePlane, nil
 	case consts.MultiplaneModeSwplb:
@@ -666,7 +707,7 @@ func validateGeneratedPlan(
 	expectedName string,
 	config *planConfig,
 	expectedStage planStage,
-) (*Plan, error) {
+) (*compiledPlan, error) {
 	document, err := decodePlanDocument(planJSON)
 	if err != nil {
 		return nil, fmt.Errorf("decode generated doSPCX %s plan: %w", expectedStage, err)

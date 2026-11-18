@@ -229,7 +229,7 @@ NicConfigurationTemplate is the Schema for the nicconfigurationtemplates API
 <tbody>
 <tr>
 <td><code>metadata</code><br />
-<em><a href="https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.31/#objectmeta-v1-meta">Kubernetes meta/v1.ObjectMeta</a></em></td>
+<em><a href="https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.36/#objectmeta-v1-meta">Kubernetes meta/v1.ObjectMeta</a></em></td>
 <td>Refer to the Kubernetes API documentation for the fields of the <code>metadata</code> field.</td>
 </tr>
 <tr>
@@ -338,7 +338,7 @@ NicDevice is the Schema for the nicdevices API
 <tbody>
 <tr>
 <td><code>metadata</code><br />
-<em><a href="https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.31/#objectmeta-v1-meta">Kubernetes meta/v1.ObjectMeta</a></em></td>
+<em><a href="https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.36/#objectmeta-v1-meta">Kubernetes meta/v1.ObjectMeta</a></em></td>
 <td>Refer to the Kubernetes API documentation for the fields of the <code>metadata</code> field.</td>
 </tr>
 <tr>
@@ -585,7 +585,7 @@ NicDeviceStatus defines the observed state of NicDevice
 <tr>
 <td><code>node</code><br />
 <em>string</em></td>
-<td><p>Node where the device is located</p></td>
+<td><p>Node where the device is located. Selectable with a status.node field selector.</p></td>
 </tr>
 <tr>
 <td><code>type</code><br />
@@ -597,12 +597,12 @@ NicDeviceStatus defines the observed state of NicDevice
 <em>string</em></td>
 <td><p>SerialNumber of the device, e.g. MT2116X09299. Informational only — not guaranteed unique across all cards on a host: on systems with embedded NICs sharing a flashed VPD image (e.g. HGX B300)
 multiple cards will report the same serial number. The operator identifies NICs uniquely by their PCI device address (the <code>pci</code> field on the first entry in <code>ports</code>, with the
-function digit stripped).</p></td>
+function digit stripped). Empty when the serial number is unavailable from PCI VPD.</p></td>
 </tr>
 <tr>
 <td><code>partNumber</code><br />
 <em>string</em></td>
-<td><p>Part number of the device, e.g. MCX713106AEHEA_QP1</p></td>
+<td><p>Part number of the device, e.g. MCX713106AEHEA_QP1. Empty when the part number is unavailable from PCI VPD.</p></td>
 </tr>
 <tr>
 <td><code>psid</code><br />
@@ -622,12 +622,12 @@ function digit stripped).</p></td>
 <tr>
 <td><code>modelName</code><br />
 <em>string</em></td>
-<td><p>ModelName is the model name of the device, e.g. ConnectX-6 or BlueField-3</p></td>
+<td><p>ModelName is the model name of the device, e.g. ConnectX-6 or BlueField-3. Empty when the model name is unavailable from PCI VPD.</p></td>
 </tr>
 <tr>
 <td><code>superNIC</code><br />
 <em>bool</em></td>
-<td><p>SuperNIC indicates if the device is a SuperNIC</p></td>
+<td><p>SuperNIC indicates if the device is a SuperNIC. False when the PCI VPD model name is unavailable.</p></td>
 </tr>
 <tr>
 <td><code>ports</code><br />
@@ -642,7 +642,7 @@ function digit stripped).</p></td>
 </tr>
 <tr>
 <td><code>conditions</code><br />
-<em><a href="https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.31/#condition-v1-meta">[]Kubernetes meta/v1.Condition</a></em></td>
+<em><a href="https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.36/#condition-v1-meta">[]Kubernetes meta/v1.Condition</a></em></td>
 <td><p>List of conditions observed for the device</p></td>
 </tr>
 </tbody>
@@ -666,7 +666,7 @@ NicFirmwareSource is the Schema for the nicfirmwaresources API
 <tbody>
 <tr>
 <td><code>metadata</code><br />
-<em><a href="https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.31/#objectmeta-v1-meta">Kubernetes meta/v1.ObjectMeta</a></em></td>
+<em><a href="https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.36/#objectmeta-v1-meta">Kubernetes meta/v1.ObjectMeta</a></em></td>
 <td>Refer to the Kubernetes API documentation for the fields of the <code>metadata</code> field.</td>
 </tr>
 <tr>
@@ -812,7 +812,7 @@ NicFirmwareTemplate is the Schema for the nicfirmwaretemplates API
 <tbody>
 <tr>
 <td><code>metadata</code><br />
-<em><a href="https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.31/#objectmeta-v1-meta">Kubernetes meta/v1.ObjectMeta</a></em></td>
+<em><a href="https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.36/#objectmeta-v1-meta">Kubernetes meta/v1.ObjectMeta</a></em></td>
 <td>Refer to the Kubernetes API documentation for the fields of the <code>metadata</code> field.</td>
 </tr>
 <tr>
@@ -906,7 +906,7 @@ NicInterfaceNameTemplate is the Schema for the nicinterfacenametemplates API
 <tbody>
 <tr>
 <td><code>metadata</code><br />
-<em><a href="https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.31/#objectmeta-v1-meta">Kubernetes meta/v1.ObjectMeta</a></em></td>
+<em><a href="https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.36/#objectmeta-v1-meta">Kubernetes meta/v1.ObjectMeta</a></em></td>
 <td>Refer to the Kubernetes API documentation for the fields of the <code>metadata</code> field.</td>
 </tr>
 <tr>
@@ -1086,7 +1086,7 @@ NicTemplateStatus defines the observed state of NicConfigurationTemplate and Nic
 </tr>
 <tr>
 <td><code>conditions</code><br />
-<em><a href="https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.31/#condition-v1-meta">[]Kubernetes meta/v1.Condition</a></em></td>
+<em><a href="https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.36/#condition-v1-meta">[]Kubernetes meta/v1.Condition</a></em></td>
 <td><p>Conditions observed for this template, e.g. a Network Bay pairing imbalance on a node</p></td>
 </tr>
 </tbody>
@@ -1169,11 +1169,6 @@ PciPerformanceOptimizedSpec specifies PCI performance optimization settings
 <td><code>enabled</code><br />
 <em>bool</em></td>
 <td><p>Specifies whether to enable PCI performance optimization</p></td>
-</tr>
-<tr>
-<td><code>maxAccOutRead</code><br />
-<em>int</em></td>
-<td><p>Deprecated: this field is ignored and no longer maps to MAX_ACC_OUT_READ.</p></td>
 </tr>
 <tr>
 <td><code>maxReadRequest</code><br />

@@ -49,6 +49,38 @@ type spectrumXNVConfigUtils interface {
 	) (types.ApplyStatus, error)
 }
 
+// Optional extension for implementations that reconcile typed and native intent.
+type spectrumXNVConfigOverrideValidator interface {
+	ValidateNvConfigXPathsWithOverrides(
+		ctx context.Context,
+		ports []v1alpha1.NicDevicePortSpec,
+		operations []dmscli.XPathOperation,
+		nativeParams map[string]string,
+		configs map[string]types.NvConfigQuery,
+	) (updateNeeded, rebootNeeded bool, err error)
+}
+
+func validateSpectrumXNVConfig(
+	ctx context.Context,
+	utils spectrumXNVConfigUtils,
+	ports []v1alpha1.NicDevicePortSpec,
+	operations []dmscli.XPathOperation,
+	nativeParams map[string]string,
+	configs map[string]types.NvConfigQuery,
+) (bool, bool, error) {
+	if len(operations) == 0 {
+		return false, false, nil
+	}
+	if len(nativeParams) == 0 {
+		return utils.ValidateNvConfigXPaths(ctx, ports, operations)
+	}
+	validator, ok := utils.(spectrumXNVConfigOverrideValidator)
+	if !ok {
+		return false, false, fmt.Errorf("configured NVConfig utility does not support doSPCX native override validation")
+	}
+	return validator.ValidateNvConfigXPathsWithOverrides(ctx, ports, operations, nativeParams, configs)
+}
+
 func (h configurationManager) preparedSpectrumXPlan(
 	device *v1alpha1.NicDevice,
 ) (*spectrumx.Plan, error) {
@@ -87,31 +119,12 @@ func (h configurationManager) preparedSpectrumXNVConfig(
 	return plan, utils, err
 }
 
-// validateSpectrumXNVConfigCompatibility rejects combinations whose native
-// NVConfig ownership cannot yet be reconciled with typed doSPCX operations.
-//
-// TODO(dospcx-nvconfig): HIGH PRIORITY -- restore rawNvConfig and Network Bay
-// support ASAP once DMS can validate their combined native/typed state.
-func validateSpectrumXNVConfigCompatibility(device *v1alpha1.NicDevice) error {
-	if !spectrumXEnabled(device) || device.Spec.Configuration.ResetToDefault {
-		return nil
-	}
-	template := device.Spec.Configuration.Template
-	if len(template.RawNvConfig) > 0 {
-		return types.IncorrectSpecError(
-			"rawNvConfig cannot currently be combined with spectrumXOptimized")
-	}
-	if template.NetworkBay != nil {
-		return types.IncorrectSpecError(
-			"networkBay cannot currently be combined with spectrumXOptimized")
-	}
-	return nil
-}
-
 func (h configurationManager) spectrumXNVConfigPhase(
 	ctx context.Context,
 	device *v1alpha1.NicDevice,
 	plan *spectrumx.Plan,
+	nativeParams map[string]string,
+	configs map[string]types.NvConfigQuery,
 ) (phase string, updateNeeded, rebootNeeded bool, err error) {
 	utils, err := h.spectrumXNVConfigUtils(device)
 	if err != nil {
@@ -123,8 +136,8 @@ func (h configurationManager) spectrumXNVConfigPhase(
 			"phase", phase,
 			"operations", len(operations),
 			"ports", len(device.Status.Ports))
-		updateNeeded, rebootNeeded, err := utils.ValidateNvConfigXPaths(
-			ctx, device.Status.Ports, operations)
+		updateNeeded, rebootNeeded, err := validateSpectrumXNVConfig(
+			ctx, utils, device.Status.Ports, operations, nativeParams, configs)
 		if err != nil {
 			return "", false, false, fmt.Errorf(
 				"validate doSPCX %s NVConfig for device %q: %w", phase, device.Name, err)
@@ -141,11 +154,9 @@ func (h configurationManager) spectrumXNVConfigPhase(
 	return validate(spectrumXNVConfigPhasePostBreakout, plan.PostBreakout)
 }
 
-// verifySpectrumXSecondaryNVConfigStaged prevents a successful primary-target
-// apply from hiding drift on split PCI functions. DMS currently executes one
-// mlxconfig command on the primary BDF, so its success response alone cannot
-// prove that every secondary function's pending state converged.
-func (h configurationManager) verifySpectrumXSecondaryNVConfigStaged(
+// verifySpectrumXNVConfigStaged checks pending state after all writes
+// so later writes to shared parameters cannot hide drift on an earlier function.
+func (h configurationManager) verifySpectrumXNVConfigStaged(
 	ctx context.Context,
 	device *v1alpha1.NicDevice,
 	utils spectrumXNVConfigUtils,
@@ -155,37 +166,38 @@ func (h configurationManager) verifySpectrumXSecondaryNVConfigStaged(
 	if len(device.Status.Ports) < 2 {
 		return nil
 	}
-	secondaryPorts := device.Status.Ports[1:]
+	ports := device.Status.Ports
 	logger := log.FromContext(ctx)
-	logger.V(2).Info("verifying doSPCX NVConfig pending state on secondary PCI functions",
+	logger.V(2).Info("verifying doSPCX NVConfig pending state on all PCI functions",
 		"device", device.Name,
-		"secondaryFunctions", len(secondaryPorts),
+		"functions", len(ports),
 		"nativeParameters", len(desiredParams),
 		"typedOperations", len(typedOperations))
 
+	// Refresh native state before checking typed leaves shadowed by overrides.
+	configs := make(map[string]types.NvConfigQuery, len(ports))
+	if len(desiredParams) > 0 {
+		for _, port := range ports {
+			config, err := h.nvConfigUtils.QueryNvConfig(ctx, port, nil)
+			if err != nil {
+				return fmt.Errorf("verify native NVConfig on PCI function %q: %w", port.PCI, err)
+			}
+			configs[port.PCI] = config
+		}
+	}
 	if len(typedOperations) > 0 {
-		updateNeeded, _, err := utils.ValidateNvConfigXPaths(ctx, secondaryPorts, typedOperations)
+		updateNeeded, _, err := validateSpectrumXNVConfig(ctx, utils, ports, typedOperations, desiredParams, configs)
 		if err != nil {
-			return fmt.Errorf("verify typed NVConfig on secondary PCI functions: %w", err)
+			return fmt.Errorf("verify typed NVConfig on all PCI functions: %w", err)
 		}
 		if updateNeeded {
-			return fmt.Errorf("DMS primary-target apply did not stage typed NVConfig on every secondary PCI function")
+			return fmt.Errorf("DMS apply did not stage typed NVConfig on every PCI function")
 		}
 	}
-	if len(desiredParams) == 0 {
-		return nil
-	}
-
-	for _, port := range secondaryPorts {
-		nvConfig, err := h.nvConfigUtils.QueryNvConfig(ctx, port, nil)
-		if err != nil {
-			return fmt.Errorf("verify native NVConfig on secondary PCI function %q: %w", port.PCI, err)
-		}
-		updateNeeded, _, _ := validateTemplateParamsApplied(
-			map[string]types.NvConfigQuery{port.PCI: nvConfig}, desiredParams)
+	for pci, config := range configs {
+		updateNeeded, _, _ := validateTemplateParamsApplied(map[string]types.NvConfigQuery{pci: config}, desiredParams)
 		if updateNeeded {
-			return fmt.Errorf(
-				"DMS primary-target apply did not stage native NVConfig on secondary PCI function %q", port.PCI)
+			return fmt.Errorf("DMS apply did not stage native NVConfig on PCI function %q", pci)
 		}
 	}
 	return nil

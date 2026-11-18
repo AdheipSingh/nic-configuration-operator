@@ -19,6 +19,7 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"maps"
 	"regexp"
 	"sort"
 	"strings"
@@ -193,6 +194,7 @@ func (h *nvConfigUtils) QueryNvConfig(ctx context.Context, port v1alpha1.NicDevi
 		}
 	}
 
+	query.AllParameters = len(parameters) == 0
 	return query, nil
 }
 
@@ -264,6 +266,18 @@ func (h *nvConfigUtils) setNvConfigParametersBatchWithXPaths(
 		return types.ApplyStatusFailed, fmt.Errorf("command executor must not be nil")
 	}
 
+	operations, laneParams, err := splitBreakoutLanes(operations)
+	if err != nil {
+		return types.ApplyStatusFailed, err
+	}
+	combined := maps.Clone(laneParams)
+	// Explicit native settings retain precedence over generated doSPCX defaults.
+	maps.Copy(combined, params)
+	params = combined
+	if len(params) == 0 && len(operations) == 0 {
+		return types.ApplyStatusNothingToDo, nil
+	}
+
 	target := "pci/" + primaryPort.PCI
 	logger := logr.FromContextOrDiscard(ctx)
 	logger.Info("applying NVConfig through DMS",
@@ -312,11 +326,29 @@ func (h *nvConfigUtils) ValidateNvConfigXPaths(
 	ports []v1alpha1.NicDevicePortSpec,
 	operations []dmscli.XPathOperation,
 ) (updateNeeded, rebootNeeded bool, err error) {
+	return h.ValidateNvConfigXPathsWithOverrides(ctx, ports, operations, nil, nil)
+}
+
+// ValidateNvConfigXPathsWithOverrides uses DMS metadata to validate native overrides
+// in place of shadowed typed intent. Configs must contain a fresh native query for
+// each PCI function. The base NVConfigUtils interface remains unchanged.
+func (h *nvConfigUtils) ValidateNvConfigXPathsWithOverrides(
+	ctx context.Context,
+	ports []v1alpha1.NicDevicePortSpec,
+	operations []dmscli.XPathOperation,
+	nativeParams map[string]string,
+	configs map[string]types.NvConfigQuery,
+) (updateNeeded, rebootNeeded bool, err error) {
 	if len(operations) == 0 {
 		return false, false, nil
 	}
 	logger := logr.FromContextOrDiscard(ctx)
-	queries := xpathQueries(operations)
+	dmsOperations, roceOperations := splitRoceValidation(operations)
+	direct, _, err := splitBreakoutLanes(dmsOperations)
+	if err != nil {
+		return false, false, err
+	}
+	queries := xpathQueries(direct)
 	queryBatches := xpathQueryBatches(queries)
 	logger.V(2).Info("validating doSPCX NVConfig on all device ports",
 		"ports", len(ports),
@@ -329,25 +361,28 @@ func (h *nvConfigUtils) ValidateNvConfigXPaths(
 			"pciAddr", port.PCI,
 			"target", target,
 			"batches", len(queryBatches))
-		result := &dmscli.QueryXPathsResult{Status: "ok", Values: map[string]map[string]any{}}
-		for batchIndex, queryBatch := range queryBatches {
-			logger.V(2).Info("querying doSPCX NVConfig batch",
-				"target", target,
-				"batch", batchIndex+1,
-				"totalBatches", len(queryBatches),
-				"paths", len(queryBatch))
-			batchResult, queryErr := dmscli.QueryXPaths(ctx, h.execInterface, target, queryBatch)
-			if queryErr != nil {
-				return false, false, fmt.Errorf("query NVConfig XPaths on target %q: %w", target, queryErr)
-			}
-			for path, values := range batchResult.Values {
-				result.Values[path] = values
-			}
+		result, queryErr := queryNVConfigXPaths(ctx, h.execInterface, target, queryBatches)
+		if queryErr != nil {
+			return false, false, queryErr
 		}
-		portUpdateNeeded, portRebootNeeded, matchErr := matchXPathValues(result, operations)
+		config, found := configs[port.PCI]
+		if len(nativeParams) > 0 && !found {
+			return false, false, fmt.Errorf("native NVConfig state is missing for target %q", target)
+		}
+		config, stateErr := h.nativeBreakoutState(ctx, port, operations, config, result)
+		if stateErr != nil {
+			return false, false, stateErr
+		}
+		portUpdateNeeded, portRebootNeeded, matchErr := matchXPathValuesWithOverrides(result, dmsOperations, nativeParams, config)
 		if matchErr != nil {
 			return false, false, fmt.Errorf("validate NVConfig XPaths on target %q: %w", target, matchErr)
 		}
+		roceUpdate, roceReboot, roceErr := h.validateNativeRoce(ctx, port, roceOperations, nativeParams, config)
+		if roceErr != nil {
+			return false, false, roceErr
+		}
+		portUpdateNeeded = portUpdateNeeded || roceUpdate
+		portRebootNeeded = portRebootNeeded || roceReboot
 		updateNeeded = updateNeeded || portUpdateNeeded
 		rebootNeeded = rebootNeeded || portRebootNeeded
 		logger.V(2).Info("doSPCX NVConfig validation complete for device port",
@@ -408,7 +443,38 @@ func xpathQueryBatches(queries []dmscli.XPathQuery) [][]dmscli.XPathQuery {
 	return append([][]dmscli.XPathQuery{batched}, individual...)
 }
 
+// queryNVConfigXPaths shares the indexed-query batching between validation and profile filtering.
+func queryNVConfigXPaths(ctx context.Context, executor execUtils.Interface, target string,
+	batches [][]dmscli.XPathQuery,
+) (*dmscli.QueryXPathsResult, error) {
+	result := &dmscli.QueryXPathsResult{Status: "ok", Values: map[string]map[string]any{}, NVConfig: map[string]string{}}
+	for index, batch := range batches {
+		logr.FromContextOrDiscard(ctx).V(2).Info("querying doSPCX NVConfig batch",
+			"target", target, "batch", index+1, "totalBatches", len(batches), "paths", len(batch))
+		part, err := dmscli.QueryXPaths(ctx, executor, target, batch)
+		if err != nil {
+			return nil, fmt.Errorf("query NVConfig XPaths on target %q: %w", target, err)
+		}
+		for path, param := range part.NVConfig {
+			result.NVConfig[path] = param
+		}
+		for path, values := range part.Values {
+			result.Values[path] = values
+		}
+	}
+	return result, nil
+}
+
 func matchXPathValues(result *dmscli.QueryXPathsResult, operations []dmscli.XPathOperation) (updateNeeded, rebootNeeded bool, err error) {
+	return matchXPathValuesWithOverrides(result, operations, nil, types.NvConfigQuery{})
+}
+
+func matchXPathValuesWithOverrides(
+	result *dmscli.QueryXPathsResult,
+	operations []dmscli.XPathOperation,
+	nativeParams map[string]string,
+	config types.NvConfigQuery,
+) (updateNeeded, rebootNeeded bool, err error) {
 	if result == nil {
 		return false, false, fmt.Errorf("DMS returned a nil XPath query result")
 	}
@@ -427,6 +493,32 @@ func matchXPathValues(result *dmscli.QueryXPathsResult, operations []dmscli.XPat
 			if !found {
 				return false, false, fmt.Errorf("DMS response does not contain XPath leaf %q/%s", operation.Path, pendingLeaf)
 			}
+			if isBreakoutLanes(operation.Path, leaf) {
+				update, reboot, err := matchLaneValues(operation.Path, desired, current, pending, nativeParams, config)
+				if err != nil {
+					return false, false, err
+				}
+				updateNeeded = updateNeeded || update
+				rebootNeeded = rebootNeeded || reboot
+				continue
+			}
+			if len(nativeParams) > 0 {
+				param, mappingErr := overrideParameter(result.NVConfig, operation.Path, leaf)
+				if mappingErr != nil {
+					return false, false, mappingErr
+				}
+				if value, overridden := nativeParams[param]; overridden {
+					// Hidden parameters are omitted from normal apply. Keep validating
+					// the typed intent; the caller reports the unsupported native value.
+					if next, supported := config.NextBootConfig[param]; supported {
+						pendingMatches := ValueMatches(next, value)
+						currentMatches := ValueMatches(config.CurrentConfig[param], value)
+						updateNeeded = updateNeeded || !pendingMatches
+						rebootNeeded = rebootNeeded || !currentMatches || !pendingMatches
+						continue
+					}
+				}
+			}
 			currentMatches := dmscli.XPathValuesEqual(current, desired)
 			pendingMatches := dmscli.XPathValuesEqual(pending, desired)
 			updateNeeded = updateNeeded || !pendingMatches
@@ -436,14 +528,25 @@ func matchXPathValues(result *dmscli.QueryXPathsResult, operations []dmscli.XPat
 	return updateNeeded, rebootNeeded, nil
 }
 
+// overrideParameter requires explicit and consistent ownership of a direct typed leaf.
+func overrideParameter(mappings map[string]string, path, leaf string) (string, error) {
+	fullPath := strings.TrimRight(path, "/") + "/" + leaf
+	param := mappings[fullPath]
+	pendingParam := mappings[fullPath+xPathPendingSuffix]
+	if param == "" || pendingParam == "" {
+		return "", fmt.Errorf("DMS NVConfig mapping metadata is required for XPath %q and its pending value when native overrides are present; use a DMS build with NVConfig GET metadata support", fullPath)
+	}
+	if pendingParam != param {
+		return "", fmt.Errorf("inconsistent DMS NVConfig mappings for current and pending XPath %q", fullPath)
+	}
+	return param, nil
+}
+
 // SetNvConfigParametersBatchWithXPaths applies native parameters and typed
 // XPath operations through one primary-target dms-cli invocation.
 //
-// TODO(dospcx-nvconfig): HIGH PRIORITY -- pass the discovered BDF set once
-// /nvidia/nvconfig/apply supports multi-target execution. The current DMS API
-// uses ports only to expand {port} in native parameter names and runs one
-// mlxconfig command on the primary BDF, so it cannot fan out to split PCI
-// functions represented as separate NicDevice ports.
+// The ports payload expands native parameter names on this BDF only. Callers
+// managing split functions invoke this method once per BDF with portCount=1.
 func (h *nvConfigUtils) SetNvConfigParametersBatchWithXPaths(
 	ctx context.Context,
 	primaryPort v1alpha1.NicDevicePortSpec,

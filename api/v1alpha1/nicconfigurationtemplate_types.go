@@ -44,8 +44,6 @@ type LinkTypeEnum string
 type PciPerformanceOptimizedSpec struct {
 	// Specifies whether to enable PCI performance optimization
 	Enabled bool `json:"enabled"`
-	// Deprecated: this field is ignored and no longer maps to MAX_ACC_OUT_READ.
-	MaxAccOutRead int `json:"maxAccOutRead,omitempty"`
 	// Specifies the size of a single PCI read request in bytes
 	// +kubebuilder:validation:Enum=128;256;512;1024;2048;4096
 	MaxReadRequest int `json:"maxReadRequest,omitempty"`
@@ -146,7 +144,7 @@ type SpectrumXOptimizedSpec struct {
 	// +optional
 	MultiplaneMode string `json:"multiplaneMode,omitempty"`
 	// Number of planes to be configured
-	// +kubebuilder:validation:Enum=1;2;4
+	// +kubebuilder:validation:Enum=1;2;4;8
 	// +kubebuilder:default:=1
 	// +optional
 	NumberOfPlanes int `json:"numberOfPlanes,omitempty"`
@@ -178,9 +176,6 @@ type NetworkBaySpec struct {
 // +kubebuilder:validation:XValidation:rule="has(self.networkBay) || has(self.linkType)",message="linkType is required unless networkBay is configured"
 // +kubebuilder:validation:XValidation:rule="!has(self.networkBay) || !has(self.linkType)",message="linkType must not be set when networkBay is configured (the Network Bay link type is governed by the system configuration)"
 // +kubebuilder:validation:XValidation:rule="!has(self.rawNvConfig) || self.rawNvConfig.all(p, !p.name.matches('.*[[][0-9]+[.][.][0-9]+[]].*'))",message="rawNvConfig parameter names must not use index-range syntax like NAME[0..3]; list each index explicitly (NAME[0], NAME[1], ...)"
-// TODO(dospcx-nvconfig): HIGH PRIORITY -- remove the next two temporary restrictions ASAP once DMS can report typed-plan native parameter ownership or validate combined typed/raw state.
-// +kubebuilder:validation:XValidation:rule="!(has(self.spectrumXOptimized) && self.spectrumXOptimized.enabled) || !has(self.rawNvConfig) || size(self.rawNvConfig) == 0",message="rawNvConfig cannot currently be combined with spectrumXOptimized"
-// +kubebuilder:validation:XValidation:rule="!(has(self.spectrumXOptimized) && self.spectrumXOptimized.enabled) || !has(self.networkBay)",message="networkBay cannot currently be combined with spectrumXOptimized"
 type ConfigurationTemplateSpec struct {
 	// Number of VFs to be configured
 	// +required
@@ -269,8 +264,4 @@ type NicConfigurationTemplateList struct {
 	metav1.TypeMeta `json:",inline"`
 	metav1.ListMeta `json:"metadata,omitempty"`
 	Items           []NicConfigurationTemplate `json:"items"`
-}
-
-func init() {
-	SchemeBuilder.Register(&NicConfigurationTemplate{}, &NicConfigurationTemplateList{})
 }

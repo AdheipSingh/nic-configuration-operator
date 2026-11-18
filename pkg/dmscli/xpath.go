@@ -49,7 +49,9 @@ type XPathQuery struct {
 
 // QueryXPathsResult is the normalized result of a typed DMS GET.
 type QueryXPathsResult struct {
-	Status       string
+	Status string
+	// NVConfig maps concrete leaf XPaths (including list predicates) to native parameter names.
+	NVConfig     map[string]string
 	Values       map[string]map[string]any
 	Failures     map[string]any
 	ErrorMessage string
@@ -171,7 +173,8 @@ func SetXPaths(
 
 func logDMSCLIOutput(ctx context.Context, command []string, target string, output utils.CommandOutput, commandErr error) {
 	fields := []any{
-		"command", command,
+		commandDurationLogKey, float64(output.Duration.Microseconds()) / 1000,
+		commandLogKey, command,
 		"target", target,
 		"stdout", boundedCommandOutput(output.Stdout),
 	}
@@ -180,7 +183,7 @@ func logDMSCLIOutput(ctx context.Context, command []string, target string, outpu
 }
 
 func xpathQueryArgs(target string, queries []XPathQuery) []string {
-	args := []string{"--json", "-t", target}
+	args := []string{jsonOutputFlag, "-t", target}
 	for index, query := range queries {
 		if index > 0 {
 			args = append(args, ";")
@@ -232,7 +235,7 @@ func xpathSetArgs(target string, operations []XPathOperation) ([]string, error) 
 		return nil, fmt.Errorf("XPath set must contain at least one operation")
 	}
 
-	args := []string{"--json", "-t", target}
+	args := []string{jsonOutputFlag, "-t", target}
 	for operationIndex, operation := range operations {
 		if err := validateXPath(operation.Path); err != nil {
 			return nil, fmt.Errorf("XPath operation at index %d: %w", operationIndex, err)
@@ -361,9 +364,9 @@ func decodeXPathQuerySuccess(output []byte, queries []XPathQuery) (*QueryXPathsR
 	if err != nil {
 		return nil, err
 	}
-	result := &QueryXPathsResult{Status: "ok", Values: make(map[string]map[string]any, len(queries))}
+	result := &QueryXPathsResult{Status: "ok", Values: make(map[string]map[string]any, len(queries)), NVConfig: map[string]string{}}
 	if len(queries) == 1 {
-		values, err := decodeValues(output)
+		values, err := decodeXPathValues(output, result.NVConfig)
 		if err != nil {
 			return nil, err
 		}
@@ -375,13 +378,41 @@ func decodeXPathQuerySuccess(output []byte, queries []XPathQuery) (*QueryXPathsR
 		if !found {
 			return nil, fmt.Errorf("dms-cli response does not contain query path %q", query.Path)
 		}
-		values, err := decodeValues(raw)
+		values, err := decodeXPathValues(raw, result.NVConfig)
 		if err != nil {
 			return nil, fmt.Errorf("decode response for query path %q: %w", query.Path, err)
 		}
 		result.Values[query.Path] = values
 	}
 	return result, nil
+}
+
+// decodeXPathValues separates DMS mapping metadata from ordinary returned leaves.
+func decodeXPathValues(raw []byte, mappings map[string]string) (map[string]any, error) {
+	values, err := decodeValues(raw)
+	if err != nil {
+		return nil, err
+	}
+	metadata, present := values["_nvconfig"]
+	if !present {
+		return values, nil
+	}
+	entries, ok := metadata.(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("DMS _nvconfig metadata must be an object")
+	}
+	for path, value := range entries {
+		param, ok := value.(string)
+		if !ok || strings.TrimSpace(param) == "" || !strings.HasPrefix(path, "/") {
+			return nil, fmt.Errorf("invalid DMS _nvconfig mapping for XPath %q", path)
+		}
+		if previous, exists := mappings[path]; exists && previous != param {
+			return nil, fmt.Errorf("conflicting DMS _nvconfig mappings for XPath %q", path)
+		}
+		mappings[path] = param
+	}
+	delete(values, "_nvconfig")
+	return values, nil
 }
 
 func decodeXPathSetSuccess(output []byte) (*SetXPathsResult, error) {

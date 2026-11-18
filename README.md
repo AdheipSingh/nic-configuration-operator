@@ -84,12 +84,11 @@ spec:
 * `pciPerformanceOptimized`: performs PCI performance optimizations. If enabled then by default the following will happen:
   * Set PCI max read request size for each PF to `4096` (note: this is a runtime config and is not persistent)
   * Users can override the runtime value via `maxReadRequest`
-  * `maxAccOutRead` is deprecated and ignored; use `rawNvConfig` for explicit `MAX_ACC_OUT_READ` management if needed.
 * `roceOptimized`: performs RoCE related optimizations. If enabled performs the following by default:
   * Nvconfig set for both ports (can be applied from PF0)
     * Conditionally applied for second port if present
       * `ROCE_CC_PRIO_MASK_P1=255`, `ROCE_CC_PRIO_MASK_P2=255`
-      * `CNP_DSCP_P1=4`, `CNP_DSCP_P2=4`
+      * `CNP_DSCP_P1=48`, `CNP_DSCP_P2=48`
       * `CNP_802P_PRIO_P1=6`, `CNP_802P_PRIO_P2=6`
   * Configure pfc (Priority Flow Control) for priority 3, set trust to dscp on each PF, set ToS (Type of Service) to 0.
     * Non-persistent (need to be applied after each boot)
@@ -103,7 +102,10 @@ spec:
 * `spectrumXOptimized`: enables Spectrum-X specific NIC optimizations. When enabled:
   * Requires `linkType=Ethernet` and `numVfs=1`
   * Cannot be combined with `roceOptimized` (RoCE settings are included automatically)
-  * Temporarily cannot be combined with `rawNvConfig` or `networkBay`. NCO cannot yet determine which native mlxconfig parameters are owned by typed doSPCX operations, so allowing either combination could create a non-convergent reconcile loop
+  * Native NVConfig precedence is `rawNvConfig` > template-derived parameters > doSPCX. Validation uses DMS GET `_nvconfig` metadata to recognize overridden typed leaves and checks their native current/next-boot values, so intentional overrides converge after reboot
+  * Requires a DMS build containing NVConfig GET mapping metadata support (DOCA changes 1508833 and 1521729) when native parameters accompany typed intent. Current and pending mappings must both be present and consistent; missing or conflicting mappings fail validation before apply, including with `force`
+  * Breakout lanes are validated from native `MODULE_SPLIT_M<module>` current/next-boot arrays and translated to concrete native assignments for apply. This avoids DMS breakout GET sibling reads and indexed-template compilation failures while keeping one combined DMS apply action and one underlying `mlxconfig set` per target. Explicit native overrides retain precedence; conflicting typed lane assignments fail before apply. Only explicitly unfiltered native snapshots are reused; filtered snapshots trigger a complete module-array refresh
+  * Can be combined with `networkBay`: doSPCX overrides system-profile defaults, while explicit template settings and `rawNvConfig` take precedence over doSPCX
   * Only supported on ConnectX-7 (`nicType: 1021`), ConnectX-8 (`nicType: 1023`), ConnectX-9 (`nicType: 1025`) and BlueField-3 SuperNIC (`nicType: a2dc`)
   * `version`: Required. Spectrum-X architecture version passed to the doSPCX planner
   * `platformType`: Required. doSPCX platform identifier defined by the supplied Blueprints profile
@@ -113,6 +115,21 @@ spec:
 * If a configuration is not set in spec, its non-volatile configuration parameters (if any) should be set to device default.
 
 #### Spectrum-X Configuration
+
+The planner profile is selected from `platformType` and `multiplaneMode`:
+
+| Platform | Mode | doSPCX profile |
+| --- | --- | --- |
+| `rtx` | `none` (or omitted) | `rtx` |
+| `vr` | `swplb` | `vr-SPX_NetPlugin` |
+| `vr` | `hwplb` | `vr-SPX_Multiplane` |
+| Other platforms | `none` / `swplb` / `hwplb` | `single-plane` / `SPX_NetPlugin` / `SPX_Multiplane` |
+
+RTX rejects multiplane modes; VR rejects single-plane mode. The supplied data
+bundle must contain the selected profile and support the requested hardware.
+VR profile selection alone does not provide complete VR support: target-map
+construction still lacks the two-NIC-per-rail layout and `nic_index_in_rail`,
+and the CRD does not yet allow eight planes for VR hardware multiplane.
 
 Spectrum-X configuration is compiled from the doSPCX data bundle published by
 the `dospcx-data` repository. The labeled ConfigMap contains a versioned format
@@ -180,8 +197,8 @@ configuration manager when it consumes the plan. `GetPreparedPlan` validates the
 device's inputs and membership against the cache; it does not reread or reparse files for every
 per-device apply. During NV validation, the configuration manager separately queries the existing
 template-derived native parameter map and the active doSPCX XPath phase. During NV apply, it sends both inputs
-in one DMS action through the primary PF and passes every available logical port number so DMS can expand
-port-scoped typed mappings.
+in one DMS action per discovered PCI function, using local port 1 consistently with validation.
+Each batch includes that function's supported native overrides.
 Breakout must match current and pending state on all device ports before post-breakout is considered.
 `force` applies the complete breakout plus post-breakout intent immediately; after the breakout
 barrier, `with-default` also resends both phases so default filling cannot undo breakout. Semantic
@@ -346,9 +363,11 @@ spec:
 The NICDevice CRD is created automatically by the configuration daemon and represents a specific NVIDIA NIC on a specific K8s node.
 The name of the device combines the node name, device type and its PCI device address (`Domain:Bus:Device`, with `:` and `.` replaced by `-`). PCI device address is used for uniqueness because serial numbers are not guaranteed unique on systems with embedded NICs that share a flashed VPD image (e.g. HGX B300).
 
+`status.node` is a selectable field, so the devices on one node can be listed with `kubectl get nicdevices -A --field-selector status.node=<node>`. The configuration daemon uses the same selector to cache only its own node's devices.
+
 `FirmwareUpdateInProgress` status condition can be used for tracking the state of the FW validation/update on a specific device. If an error occurs during FW update, it will be reflected in this field.
 `ConfigUpdateInProgress` status condition can be used for tracking the state of the FW configuration update on a specific device. If an error occurs during FW configuration update, it will be reflected in this field.
-Before validating runtime configuration, the configuration daemon checks every discovered network interface for carrier. An interface reported as `NO-CARRIER` causes runtime validation to fail and is reflected in `ConfigUpdateInProgress` with reason `RuntimeConfigUpdateFailed` until carrier is restored.
+Before validating runtime configuration, the configuration daemon checks every discovered network interface for carrier. Runtime validation fails only when all interfaces on the NIC report `NO-CARRIER`, and the failure is reflected in `ConfigUpdateInProgress` with reason `RuntimeConfigUpdateFailed` until at least one interface has carrier. This allows available planes to be configured while other planes are disconnected.
 
 for more information refer to [api-reference](docs/api-reference.md).
 
@@ -402,14 +421,20 @@ The NicDevice CRD is created and reconciled by the configuration daemon. The rec
 
 ### NicInterfaceNameTemplate
 
-The NicInterfaceNameTemplate CRD allows you to define custom naming patterns for RDMA and network device interfaces on Spectrum-X NICs. This is useful in multiplane and multi-rail deployments where predictable interface naming is required.
+The NicInterfaceNameTemplate CRD allows you to define custom naming patterns for RDMA and network device interfaces. This is useful in multiplane and multi-rail deployments, and on nodes where different groups of NICs need stable names based on their fabric role.
 
 The operator deploys udev rules to the host to rename network and RDMA interfaces according to the specified naming template.
+
+Multiple templates can select the same node when their `railPciAddresses` select disjoint `NicDevice` objects. Each template has its own prefixes and zero-based indices, allowing names such as `ew0`, `ns0`, and `admin0` on one node. If two templates select any port of the same `NicDevice`, the controller rejects the proposed assignment and preserves the existing naming specs and udev rules. See the [fabric-role example](docs/examples/example-nicinterfacenametemplate-fabric-roles.yaml).
+
+Naming ownership is per `NicDevice`, including every PF represented by that object. Different PFs of one `NicDevice` cannot be split across templates. Generated netdev names must be unique among netdevs, and generated RDMA names must be unique among RDMA devices. The same name may be used once in each namespace to align a netdev with its RDMA device.
 
 The template uses the following placeholders for device name construction:
 * `%nic_id%`: The index of the NIC in the flattened list of NICs
 * `%plane_id%`: The index of the plane of the specific NIC
 * `%rail_id%`: The index of the rail where the given NIC belongs to
+
+List one PCI address per `NicDevice` in `railPciAddresses`. For a multi-PF device, `pfsPerNic` determines how many PF naming rules are generated. The `%nic_id%` value is shared by all PFs of that device; use `%plane_id%` when each PF needs a distinct name.
 
 #### [Example NicInterfaceNameTemplate](docs/examples/spectrum-x/example-nicinterfacenametemplate-spectrum-x.yaml):
 
@@ -429,6 +454,8 @@ spec:
 ```
 
 The `railPciAddresses` field defines the PCI address to rail mapping. The first dimension is the rail index and the second dimension is the list of PCI addresses of the NICs in that rail.
+
+Set only `netDevicePrefix` to rename netdevs without renaming RDMA devices. To rename only RDMA devices, set `netDevicePrefix: ""` explicitly and provide `rdmaDevicePrefix`; the `netDevicePrefix` field remains required by the API schema. At least one prefix must be non-empty.
 
 #### Generated udev rules
 
@@ -478,6 +505,10 @@ To indicate when NIC configuration is in progress to the pods that depend on it,
 To use this mechanism, the next pods in the pipeline can add `nvidia.com/operator.nic-configuration.wait=false` to their node label selectors. That way, they will automatically be evicted from the node when the NICs are being configured.
 
 The NIC Configuration Daemon itself relies on the `network.nvidia.com/operator.mofed.wait=false` label to be present on the node as it requires the DOCA-OFED driver to be running for some of the configurations.
+
+During device discovery, the daemon queries firmware version and PSID with `flint`. If `flint` cannot query a PCI function, the daemon reads the running firmware version and PSID from the function's RDMA sysfs attributes (`fw_ver` and `board_id`). Both values are required; if neither source provides complete firmware information, discovery follows the existing error or `SKIP_DEVICE_ON_DISCOVERY_ERROR` behavior.
+
+PCI VPD metadata is optional during discovery. NICs with missing, unreadable, or invalid VPD still get a `NicDevice` CR with unavailable `status.serialNumber`, `status.partNumber`, and `status.modelName` fields set to empty strings. Available fields are retained, including metadata read from another PCI function of the same NIC. This applies regardless of `SKIP_DEVICE_ON_DISCOVERY_ERROR`. Without a VPD model name, `status.superNIC` is `false`. Select these NICs by node, NIC type, or PCI address rather than unavailable serial/part numbers. ConnectX-9 Network Bay pairing and Network Bay templates require a nonempty serial number.
 
 ## Feature flags
 Feature flags can be enabled via environment variables in the helm chart or NVIDIA Network Operator's NicClusterPolicy.

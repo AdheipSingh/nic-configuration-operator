@@ -190,13 +190,13 @@ func (r *NicDeviceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 				return ctrl.Result{}, err
 			}
 		}
-		return ctrl.Result{Requeue: true, RequeueAfter: longRequeueTime}, nil
+		return ctrl.Result{RequeueAfter: longRequeueTime}, nil
 	}
 
 	log.Log.Info("firmware is ready for all devices, proceeding with NIC configuration")
 
-	// Build or retrieve the complete node-scoped doSPCX plan before validating
-	// and applying individual devices.
+	// Prepare the node-scoped doSPCX plan. Configure may be deferred until
+	// the prepare NVConfig changes have taken effect.
 	planDevices, err := r.prepareSpectrumXPlan(ctx, configStatuses)
 	if err != nil {
 		planErr := fmt.Errorf("prepare doSPCX configuration plan: %w", err)
@@ -238,7 +238,16 @@ func (r *NicDeviceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 
 	if !configStatuses.nvConfigReadyForAll() {
 		log.Log.Info("nv config not ready for some devices, requeue")
-		return ctrl.Result{Requeue: true, RequeueAfter: longRequeueTime}, nil
+		return ctrl.Result{RequeueAfter: longRequeueTime}, nil
+	}
+
+	// Require configure before runtime handling, including its spec-change reboot.
+	// A missing configure target must not trigger another reboot once NVConfig is ready.
+	if planErr := r.validateSpectrumXConfigurePlans(planDevices); planErr != nil {
+		planErr = fmt.Errorf("doSPCX configure plan is not ready: %w", planErr)
+		statusErr := r.updateSpectrumXPlanFailureStatus(
+			ctx, planDevices, consts.SpecValidationFailed, planErr)
+		return ctrl.Result{}, errors.Join(planErr, statusErr)
 	}
 
 	log.Log.Info("applying runtime config")
@@ -309,7 +318,7 @@ func (r *NicDeviceReconciler) reconcileInterfaceNameTemplates(ctx context.Contex
 			port.RdmaInterface = actualRdmaDevice
 
 			// Compare actual vs expected
-			if actualNetDevice != expected.NetDevice {
+			if expected.NetDevice != "" && actualNetDevice != expected.NetDevice {
 				mismatchedPorts = append(mismatchedPorts,
 					fmt.Sprintf("net:%s expected=%s actual=%s", port.PCI, expected.NetDevice, actualNetDevice))
 			}
@@ -512,6 +521,22 @@ func (r *NicDeviceReconciler) prepareSpectrumXPlan(
 		return nil, nil
 	}
 	return devices, r.SpectrumXManager.PreparePlan(ctx, devices)
+}
+
+func (r *NicDeviceReconciler) validateSpectrumXConfigurePlans(devices []*v1alpha1.NicDevice) error {
+	for _, device := range devices {
+		plan, err := r.SpectrumXManager.GetPreparedPlan(device)
+		if err != nil {
+			return err
+		}
+		if plan == nil {
+			return fmt.Errorf("prepared plan is missing for device %q", device.Name)
+		}
+		if plan.ConfigureError != nil {
+			return plan.ConfigureError
+		}
+	}
+	return nil
 }
 
 func spectrumXDevicesForPlan(statuses nicDeviceConfigurationStatuses) []*v1alpha1.NicDevice {
@@ -720,7 +745,6 @@ func (r *NicDeviceReconciler) handleConfigurationSpecValidation(ctx context.Cont
 	}
 
 	nvConfigUpdateRequired, rebootRequired, unsupportedNvParams, err := r.ConfigurationManager.ValidateDeviceNvSpec(ctx, status.device)
-	log.Log.V(2).Info("nv spec validation complete for device", "device", status.device.Name, "nvConfigUpdateRequired", nvConfigUpdateRequired, "rebootRequired", rebootRequired, "unsupportedNvParams", unsupportedNvParams)
 	if err != nil {
 		log.Log.Error(err, "failed to validate spec for device", "device", status.device.Name)
 		if types.IsIncorrectSpecError(err) {
@@ -737,6 +761,8 @@ func (r *NicDeviceReconciler) handleConfigurationSpecValidation(ctx context.Cont
 
 		return err
 	}
+
+	log.Log.V(2).Info("nv spec validation complete for device", "device", status.device.Name, "nvConfigUpdateRequired", nvConfigUpdateRequired, "rebootRequired", rebootRequired, "unsupportedNvParams", unsupportedNvParams)
 
 	status.nvConfigUpdateRequired = nvConfigUpdateRequired
 	status.rebootRequired = rebootRequired
